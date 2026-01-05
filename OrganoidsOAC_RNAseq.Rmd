@@ -1,0 +1,256 @@
+---
+title: "RNA-seq Analysis of OAC organoids"
+output: html_document
+date: "2025-12-04"
+---
+
+This script will be used as a review of the RNA-seq analysis of our OAC-derived organoids. In this case, we are broadly aiming to gauge the phenotypic heterogeneity of our organoids, and whether any interesting features could be observed to explain it.
+
+```{r load-libraries, message=FALSE}
+library(readxl) # read Excel files
+library(tidyverse) # for data table manipulation
+library(SummarizedExperiment) # for SummarizedExperiment object generation
+library(ggplot2) # plotting
+library(fgsea) # for fast gene-set enrichment analysis
+library(ensembldb) # gene information
+library(EnsDb.Hsapiens.v79) # gene information
+library(DESeq2) # differentatial expression analysis
+library(sva) # batch correction
+```
+
+# Unsupervised Analysis
+
+As an initial indication of the heterogeneity of our OAC organoids, we can simply project them onto a PCA and see if a clinical feature (e.g. stage) is associated.
+
+```{r collate sequencing metadata}
+# Load metadata (this only contains normal and BO organoids - the remainder of the cohort is OAC)
+meta.seq <- read.csv('Data/case_sex_spec_pheno_source_site_pass_batch_seq_org_cases.csv') %>%
+  dplyr::filter(strategy == 'rna' &
+           specimen_source == 'organoid' &
+           specimen_phenotype %in% c('oac','OAC','tumour') &
+           !(sequencing_batch %in% c('SLX-19631','SLX-21330'))) # only 1 organoid per batch
+
+# Fix sequence IDs
+meta.seq$sequence_id <- sapply(meta.seq$sequence_id, function(x) str_replace(x,pattern='1672_',replacement=''))
+meta.seq$sequence_id <- sapply(meta.seq$sequence_id, function(x) str_replace(x,pattern='1441_',replacement=''))
+
+index.1672_include <- which(meta.seq$sequence_id %in% c('WTSI-OESO_198_1pre','WTSI-OESO_211_1pre','WTSI-OESO_224_1pre'))
+meta.seq$sequence_id[index.1672_include] <- paste0('1672_',meta.seq$sequence_id[index.1672_include])
+
+# Add clinical information, and merge this with metadata
+meta.clin <- read_excel('Data/query_standard_cohort_2025-03-25_16-27-46.xlsx') %>%
+  dplyr::filter(!duplicated(`OCCAMS ID`)) %>%
+  dplyr::select(`OCCAMS ID`,`PS TStage Primary Tumour Final Pretreatment Staging`,
+                `RP Tumour Grading Differentiation Status`,`TRNC Chemotherapy Treatment Protocol`)
+names(meta.clin) <- c('case_id','Stage','DifferentiationStatus','ChemoTreatment')
+
+# Fix staging nomenclature
+meta.clin$Stage[meta.clin$Stage == 'tumour_invades_adventitia'] <- 'T3'
+meta.clin$Stage[meta.clin$Stage == 'tumour_invades_muscularis_propria'] <- 'T2'
+
+meta <- merge(x = meta.seq, y = meta.clin)
+
+```
+
+## Collate counts data
+
+Now that we have defined the organoids to be extracted, we can now collate all of our transcriptomic data, and subset on it to specifically highlight OAC organoids.
+
+
+```{r SummarizedExperiment object generation}
+# Create counts matrices (raw and TPM)
+#   Include sequence_id as a column name
+#   These will eventually be replaced by matched specimen IDs
+counts_list <- counts.TPM_list <- list()
+files.rnaseq <- list.files(path = 'Data', full.names = TRUE, pattern = 'rpkm_tpm.txt')
+files.rnaseq <- files.rnaseq[!grepl(pattern = 'SLX', files.rnaseq)]
+
+for (file in files.rnaseq) {
+  
+  file.counts <- read.table(file, header = TRUE)
+  
+  # Isolate specimen ID
+  file.sequence_id <- strsplit(strsplit(file, split='/')[[1]][2], split='__')[[1]][1]
+  
+  # Add to counts lists
+  counts_list[[file.sequence_id]] <- file.counts$readcounts_union
+  counts.TPM_list[[file.sequence_id]] <- file.counts$TPM_union
+  
+}
+
+# Collate lists into count matrices (and specifically extract those in meta$sequence_id)
+counts <- do.call(bind_cols, counts_list[meta$sequence_id]) %>% as.matrix
+counts.TPM <- do.call(bind_cols, counts.TPM_list[meta$sequence_id]) %>% as.matrix
+
+# Add rownames(genes)
+rownames(counts) <- rownames(file.counts)
+rownames(counts.TPM) <- rownames(file.counts)
+
+# Generate col_data and row_data, for eventual collation into a SummatizedExperiment object
+col_data <- meta %>% dplyr::select('sequence_id','case_id','passage','sequencing_batch',
+                                   'Stage','DifferentiationStatus','ChemoTreatment') %>% 
+  as.data.frame
+rownames(col_data) <- col_data$sequence_id
+
+# Subset for earliest-passage PDO
+col_data <- col_data %>%
+  arrange(as.numeric(passage)) %>%
+  group_by(case_id) %>%
+  slice_head() %>% as.data.frame
+rownames(col_data) <- col_data$sequence_id
+counts <- counts[,rownames(col_data)]
+counts.TPM <- counts.TPM[,rownames(col_data)]
+
+row_data <- ensembldb::select(
+  EnsDb.Hsapiens.v79,
+  keys = rownames(counts),
+  keytype = 'GENEID',
+  columns = c('GENEID','SYMBOL')
+)
+counts <- counts[row_data$GENEID,]
+counts.TPM <- counts.TPM[row_data$GENEID, ]
+
+# Create SummarizedExperiment object
+se <- SummarizedExperiment(assays = list(counts = counts),
+                           rowData = row_data, colData = col_data)
+
+```
+
+On this, we can simply begin by conducting a principal component analysis. This will require conversion to a DESeq format, followed by batch correction (for sequencing batch) and variance stabilising transformation, before PCA.
+
+```{r PCA}
+# Create DESeq2 object
+dds <- DESeqDataSet(se, design = ~ 1) # No direct comparisons
+
+# Remove lowly-expressed genes and estimate size factors
+dds <- dds[apply(counts(dds), 1, function(x) mean(x>50)>.25), ] # remove genes with <50 reads in >25% organoids
+dds <- estimateSizeFactors(dds)
+
+# Variance stabilising transformation
+vsd <- vst(dds, blind = FALSE)
+
+# batch correction
+vsd_combat.data <- ComBat(dat = assay(vsd), batch = vsd$sequencing_batch)
+vsd_combat <- vsd; assay(vsd_combat) <- vsd_combat.data
+
+plotPCA(vsd_combat, intgroup = 'sequencing_batch', ntop = 1000)
+
+```
+
+Since there seems to be plenty of heterogeneity displayed within these organoids, we can run fgsea on the PCA loadings to get a sense of cancer hallmark processes which may be driving it.
+
+```{r fgsea-PCA}
+# Re-run principal component analysis on top 1000 variable genes
+var_genes <- apply(assay(vsd_combat), 1, var)
+vsd_combat.pca_plot <- vsd_combat[var_genes >= sort(var_genes, decreasing = TRUE)[1000], ]
+
+pca.vsd_combat <- prcomp(t(assay(vsd_combat.pca_plot)), center = TRUE)
+print(summary(pca.vsd_combat))
+df.pca <- data.frame(
+  PC1 = pca.vsd_combat$x[,'PC1'], PC2 = pca.vsd_combat$x[,'PC2'],
+  Stage = vsd_combat.pca_plot$Stage, Batch = vsd_combat.pca_plot$sequencing_batch
+)
+
+# Check sequencing batch
+ggplot(df.pca, aes(x = PC1, y = PC2, color = Batch)) + theme_bw() + geom_point()
+
+# Check Stage
+pdf('Results/OrganoidsOAC_RNAseq_PCAbyStage.pdf', width=5, height=5)
+ggplot(df.pca, aes(x = PC1, y = PC2, color = Stage)) + theme_bw() +
+  geom_point() +
+  labs(x = 'PC1: 12.5% variance', y = 'PC2: 12.0% variance') +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  scale_color_manual(values = c('yellow2','gold','orange','orangered'))
+dev.off()
+
+```
+
+Now that we have our principal components, we can check how cancer hallmarks contribute to their heterogeneity using gene set enrichment analysis
+
+```{r fgsea}
+# Load in hallmark gene sets (Hs.H)
+load('Data/human_H_v5p2.rdata')
+
+# Starting with PC1, we can obtain the EntrezIDs for ranked contributors and do fgsea
+df.pc1 <- data.frame(EnsemblID = rownames(pca.vsd_combat$rotation), PC1 = pca.vsd_combat$rotation[,'PC1'])
+entrez = ensembldb::select(
+  EnsDb.Hsapiens.v79,
+  keys = df.pc1$EnsemblID,
+  columns = c('GENEID','ENTREZID'),
+  keytype = 'GENEID')
+df.pc1 <- merge(x = df.pc1, y = entrez, by.x = 'EnsemblID', by.y = 'GENEID')
+df.pc1 <- df.pc1 %>% dplyr::filter(!duplicated(EnsemblID) &
+                                     !is.na(ENTREZID))
+
+# Create ranks
+df.pc1 <- df.pc1 %>% arrange(PC1)
+ranks <- df.pc1$PC1; names(ranks) <- df.pc1$ENTREZID
+
+# Run fgsea
+set.seed(123)
+res.fgsea <- fgsea(pathways = Hs.H, stats = ranks)
+
+df_res.fgsea <- res.fgsea %>% as.data.frame() %>%
+  dplyr::filter(padj < 0.4) %>% arrange(NES) %>%
+  mutate(pathway = factor(pathway, levels = pathway))
+ggplot(df_res.fgsea, aes(x = NES, y = pathway, fill = padj)) + theme_bw() +
+  geom_bar(stat = 'identity') +
+  labs(x = 'Normalised Enrichment Score: PC1 Loading', y ='')
+ggsave(filename = 'Results/OrganoidsOAC_RNAseq_fgsea_PC1.pdf', height = 4)
+```
+
+For the sake of completion, we can check PC2 as well.
+
+```{r fgsea-PC2}
+# Starting with PC1, we can obtain the EntrezIDs for ranked contributors and do fgsea
+df.pc2 <- data.frame(EnsemblID = rownames(pca.vsd_combat$rotation), PC2 = pca.vsd_combat$rotation[,'PC2'])
+entrez = ensembldb::select(
+  EnsDb.Hsapiens.v79,
+  keys = df.pc2$EnsemblID,
+  columns = c('GENEID','ENTREZID'),
+  keytype = 'GENEID')
+df.pc2 <- merge(x = df.pc2, y = entrez, by.x = 'EnsemblID', by.y = 'GENEID')
+df.pc2 <- df.pc2 %>% dplyr::filter(!duplicated(EnsemblID) &
+                                     !is.na(ENTREZID))
+
+# Create ranks
+df.pc2 <- df.pc2 %>% arrange(PC2)
+ranks <- df.pc2$PC2; names(ranks) <- df.pc2$ENTREZID
+
+# Run fgsea
+set.seed(123)
+res.fgsea <- fgsea(pathways = Hs.H, stats = ranks)
+
+df_res.fgsea <- res.fgsea %>% as.data.frame() %>%
+  dplyr::filter(padj < 0.2) %>% arrange(NES) %>%
+  mutate(pathway = factor(pathway, levels = pathway))
+ggplot(df_res.fgsea, aes(x = NES, y = pathway, fill = padj)) + theme_bw() +
+  geom_bar(stat = 'identity') +
+  labs(x = 'Normalised Enrichment Score: PC2 Loading', y ='')
+ggsave(filename = 'Results/OrganoidsOAC_RNAseq_fgsea_PC2.pdf', height = 4)
+```
+
+To align with PDOs treated with a CDK4/6 inhibitor (abemaciclib), we can compare their responses with other potential markers of response. We extract the TPM-normalised values here.
+
+```{r extract-cdki}
+# Re-create se.tpm file (this will make things easier)
+se.tpm <- SummarizedExperiment(assays = list(counts.TPM = counts.TPM),
+                               rowData = row_data, colData = col_data)
+
+# Subset for CDKi-treated PDOs, and select the earliest passages
+se.tpm <- se.tpm[,se.tpm$case_id %in% c('OCCAMS/AH/277','OCCAMS/AH/401','OCCAMS/AH/429','OCCAMS/AH/535')]
+se.tpm_col = colData(se.tpm) %>% as.data.frame 
+
+# Add relevant genes to se.tpm_col
+se.tpm_col$RB1_TPM = assay(se.tpm)[which(rowData(se.tpm)$SYMBOL == 'RB1'),]
+se.tpm_col$RB1_vsd_combat = assay(vsd_combat)[which(rowData(vsd_combat)$SYMBOL == 'RB1'), se.tpm_col$sequence_id]
+
+se.tpm_col$ESR1_TPM = assay(se.tpm)[which(rowData(se.tpm)$SYMBOL == 'ESR1'),]
+# se.tpm_col$ESR1_vsd_combat = assay(vsd_combat)[which(rowData(vsd_combat)$SYMBOL == 'ESR1'), se.tpm_col$sequence_id]
+
+se.tpm_col$CCNE1_TPM = assay(se.tpm)[which(rowData(se.tpm)$SYMBOL == 'CCNE1'),]
+se.tpm_col$CCNE1_vsd_combat = assay(vsd_combat)[which(rowData(vsd_combat)$SYMBOL == 'CCNE1'), se.tpm_col$sequence_id]
+
+write.csv(se.tpm_col, file = 'Results/OrganoidsOAC_treatedCDK46i_Markers.csv')
+```
+

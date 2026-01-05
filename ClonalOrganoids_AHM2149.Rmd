@@ -1,0 +1,958 @@
+---
+title: "Profiling of single-clone organoids obtained from the AHM2149 NDBO-derived organoid"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "2025-05-23"
+---
+
+In this script, we will conduct complete profiling of single-clone organoids derived from an organoid obtained from the NDBO patient AHM2149. This include:
+
+* Profiling of mutation overlap and concordance with the matched bulk organoid and tissue, and demonstration of clonality within the organoids.
+* Demonstration of shared mutations and OAC drivers (as defined by Frankell et al. 2019)
+* Mutational signature analysis
+* Phylogenetic analysis and branch-signature assignment
+* Concordance with RNA-seq data, and alignment on a gastric-intestinal axis
+
+```{r load libraries, message=FALSE}
+library(readxl) # to read excel files
+library(tidyverse) # data table manipulation
+library(vcfR) # to read VCF files
+library(biomaRt) # for Ensembl access
+library(ComplexHeatmap) # for oncoplot generation
+library(circlize)
+library(deconstructSigs) # signature fitting
+library(BSgenome.Hsapiens.UCSC.hg19) # hg19 reference for context determination
+library(ggplot2) # plotting
+library(ggpubr) # statistics in plotting
+library(ggrepel)
+library(tune) # for scale-fitting
+library(phangorn) # phylogenetic analysis
+library(ggtree) # for tree plotting
+library(reshape2)
+library(EnsDb.Hsapiens.v79) # Ensembl gene ID access
+library(SummarizedExperiment) # RNA-seq data processing
+library(DESeq2) # Further RNA-seq processing
+library(vsn) # variance stabilizing transformation
+library(pheatmap) # heatmap plotting for RNA-seq
+library(RColorBrewer) # colour gradients
+library(GSVA) # gene set variation analysis
+```
+
+# Concordance and Clonality
+
+To begin, we can load in the full set of SNV and indel data in order to demonstrate:
+
+* Clonality: by virtue of how these organoids are derived, they should represent an individual clone. Consequently, the mutations should show a Normal distribution of VAFs with a mean of 50%.
+* Concordance: these organoids should display significant overlap with their matched tissue, bulk organoid, and also their neighbouring clonal organoids.
+
+## VCF processing and data collection
+
+We can start by collecting the relevant metadata for our WGS analysis
+
+```{r establish metadata}
+meta <- read_excel('Data/WGS for organoid paper_to Daniel and Ginny.xlsx', skip=3)
+
+meta.ahm <- meta %>%
+  dplyr::filter(`Patient ID` == 'AHM2149' & `Tissue/Organoid Grade` == 'BE No dysplasia') %>%
+  mutate(`Tissue/Organoid Grade` = 'BO No dysplasia',
+         `Highest grade` = 'BO No dysplasia',
+         `Sample ID` = sapply(`Sample ID`, function(x) str_replace(x, pattern = 'BE', replacement = 'BO')))
+```
+
+Next, we can establish the set of files to load in, from which we can derive our matched indices for our metadata.
+
+Once these are defined, for each file:
+
+* read in information
+* if SNVs (as opposed to indels), the obtain the VAFs
+* write into shared file
+
+```{r load SNVs and indels}
+
+# Establish files
+sample.files <- list.files(path = 'Data/WGS/strelka', pattern = '.vcf$', recursive = TRUE, full.names = TRUE)
+
+sample.files_index <- sapply(sample.files, function(x) strsplit(strsplit(x,split='_vs_')[[1]][1],split='[.]')[[1]][2])
+sample.files_index <- sapply(sample.files_index, function(x) paste(strsplit(x,split='_')[[1]],collapse='-'))
+
+# Read in data and initialise data frame for tracking TMB
+muts.full <- data.frame()
+df.tmb <- data.frame()
+
+for (file in sample.files) {
+  
+  # Read in file
+  seqID.i <- sapply(file, function(x) strsplit(strsplit(x,split='/')[[1]][4], split='_vs_')[[1]][1])
+  vcf.i <- read.vcfR(file, verbose = FALSE)@fix %>% as.data.frame
+  
+  # Track number of mutations in df.tmb (this will include SNVs and indels)
+  df.tmb <- rbind(df.tmb,
+                  data.frame(sequence_id = seqID.i,
+                             num_mutations = nrow(vcf.i)))
+  
+  # Add specimen info
+  index <- strsplit(strsplit(file, split='_vs_')[[1]][1], split='[.]')[[1]][2]
+  index <- paste0('SLX-21369.', index, '; SLX-26253.', index)
+  
+  if (index %in% meta.ahm$Index) {
+    
+    specimenID <- meta.ahm$`Sample ID`[meta.ahm$Index == index]
+    
+    vcf.i$SPECIMEN_ID <- specimenID
+    
+    # Add depth and VAF info
+    if (grepl(pattern = '.snp.pass.vcf', file)) {
+      vcf.i$DEPTH <- sapply(vcf.i$INFO, function(x) as.numeric(strsplit(strsplit(x,split=';')[[1]][1],split='=')[[1]][2]))
+      vcf.i$VAF <- sapply(vcf.i$INFO, function(x) as.numeric(strsplit(strsplit(x,split=';')[[1]][28],split='=')[[1]][2]))
+    } else {
+      vcf.i$DEPTH <- NA
+      vcf.i$VAF <- NA
+    }
+    
+    # Save output (remove full INFO column)
+    muts.full <- rbind(muts.full, vcf.i[,-8])
+    
+  }
+
+}
+
+# Summarise mutation counts
+df.tmb <- df.tmb %>% group_by(sequence_id) %>% summarise(n_mutation = sum(num_mutations)) %>%
+  mutate(TMB = n_mutation/3100)
+
+# # Save output
+# write.table(muts.full, file = 'Data/WGS/strelka/AHM2149_allVCFs.txt',
+#             sep ='\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+```
+
+
+## Check VAF distributions across samples
+
+Here, we want to check that the VAFs of the single-clonal organoid are Normally distributed.
+
+```{r clonality check}
+
+# Create snappier titles for each organoid (remove 'OGD_AHM2149' and matrigel information)
+muts.full$SPECIMEN_ID_short <- sapply(muts.full$SPECIMEN_ID, function(x) strsplit(x,split='_')[[1]][2])
+muts.full$SPECIMEN_ID_short <- sapply(muts.full$SPECIMEN_ID_short, function(x) substr(x,9,nchar(x)))
+muts.full$SPECIMEN_ID_short[muts.full$SPECIMEN_ID_short == 'BO'] <- 'BO.bulk'
+
+# Add tissue ID
+muts.full$SPECIMEN_ID_short[muts.full$SPECIMEN_ID == 'AHM2149.BO-tissue'] <- 'BO.tissue'
+
+# Add organoid type
+muts.full$OrganoidType <- sapply(muts.full$SPECIMEN_ID, function(x) 
+  ifelse(x == 'OGD_AHM2149.BO_OWR_P2', 'Bulk Organoid', 
+         ifelse(x == 'AHM2149.BO-tissue', 'Tissue', 'Single-Cell Derived Organoid')))
+
+ggplot(muts.full[muts.full$OrganoidType %in% c('Bulk Organoid','Single-Cell Derived Organoid'),], 
+       aes(x = VAF, fill = OrganoidType)) +
+  geom_histogram(bins = 100) + theme_minimal() +
+  scale_fill_manual(values = c('darkred','pink2', 'blue2')) +
+  facet_wrap(~SPECIMEN_ID_short, scales = 'free') +
+  # theme(legend.position = 'top', legend.title = element_blank()) + 
+  labs(x = 'Variant Allele Frequency', y = 'Mutation Count') +
+  ggtitle('AHM/2149 (BO - no dysplasia)')
+# ggsave(filename = 'Results/AHM2149_VAFdistributions.pdf',
+#        width = 8, height = 8)
+
+ggplot(muts.full[muts.full$OrganoidType %in% 'Single-Cell Derived Organoid',],
+       aes(x = 100*VAF, fill = SPECIMEN_ID_short)) + 
+  geom_density(alpha = .1) + theme_minimal() +
+  # theme(legend.position = 'none') +
+  labs(x = 'Variant Allele Frequency (%)', y = '') +
+  ggtitle('AHM/2149 (NDBO)')
+# ggsave(filename = 'Results/AHM2149_VAFdistributions_noFacet.pdf',
+#        width = 5, height = 5) 
+
+
+```
+
+As we can see, whilst the bulk samples (organoid and tissue) display patterns of subclonality, the single-clonal organoids only describe individual clones.
+
+## Check mutational concordance across organoids
+
+Now we can determine the extent of overlap across the organoids. The concordance across the AHM2149 bulk tissue and organoid is determined previously, so here we shall focus on concordance between the bulk and single-clonal organoids.
+
+```{r concordance check}
+# Generate mutation IDs and separate into bulk and sc-derived mutations, noting the removal of the tissue sample
+muts.full$MUTATION_ID <- apply(muts.full, 1, function(x)
+  paste(x['CHROM'],x['POS'],x['REF'],x['ALT'], sep = '_'))
+
+muts.bulk <- muts.full %>% dplyr::filter(SPECIMEN_ID == 'OGD_AHM2149.BO_OWR_P2')
+muts.sc <- muts.full %>% dplyr::filter(!(SPECIMEN_ID %in% c('OGD_AHM2149.BO_OWR_P2','AHM2149.BO-tissue')))
+
+# Pivot out muts.sc to see shared mutations across sc-derived organoids
+muts.sc <- muts.sc %>%
+  dplyr::select(MUTATION_ID, SPECIMEN_ID_short, VAF) %>%
+  pivot_wider(names_from = SPECIMEN_ID_short, values_from = VAF) %>%
+  column_to_rownames(var = 'MUTATION_ID')
+
+# Label mutations as 'Private' or 'Shared with SC-Organoids'
+#   and label those found in muts.bulk as 'Shared with Bulk'
+
+muts.sc$Label <- apply(muts.sc, 1, function(x) ifelse(sum(!is.na(x)) == 1,
+                                                      'Private', 'Shared with an sc-organoid'))
+muts.sc$Label[rownames(muts.sc) %in% muts.bulk$MUTATION_ID] <- 'Shared with Bulk Organoid'
+
+# Pivot back and summarise muts.sc table for plotting
+muts.sc_summary <- muts.sc %>%
+  mutate(MUTATION_ID = rownames(muts.sc)) %>%
+  pivot_longer(cols = -c(MUTATION_ID, Label), names_to = 'SPECIMEN_ID', values_to = 'VAF') %>%
+  dplyr::filter(!is.na(VAF)) %>%
+  group_by(SPECIMEN_ID, Label) %>%
+  summarise(num_mutations = n()) %>%
+  mutate(Label = factor(Label, levels = c('Private', 'Shared with an sc-organoid', 'Shared with Bulk Organoid')))
+
+# Rank organoids by total mutations shared with bulk organoid
+muts.total <- muts.sc_summary %>%
+  group_by(SPECIMEN_ID) %>%
+  summarise(num_total = sum(num_mutations)) %>%
+  arrange(num_total)
+muts.sc_summary$SPECIMEN_ID <- factor(muts.sc_summary$SPECIMEN_ID,
+                                      levels = muts.total$SPECIMEN_ID)
+
+# Plot the overall concordances
+ggplot(muts.sc_summary, aes(x = num_mutations, y = SPECIMEN_ID, fill = Label)) +
+  geom_bar(stat = 'identity') + theme_minimal() +
+  xlab('Total Number of Mutations') +
+  theme(legend.position = 'top', legend.title = element_blank(),
+        axis.title.y = element_blank()) +
+  scale_fill_manual(values = c('pink2','orange2','darkred')) +
+  ggtitle('AHM/2149 (BO - no dysplasia) Mutation Overlap')
+ggsave(filename = 'Results/AHM2149_SharedMutations.pdf')
+
+# Check proportions of mutations across sc-organoids which are private
+muts.sc_private <- muts.sc_summary %>%
+  dplyr::filter(Label == 'Private') %>%
+  inner_join(muts.total) %>%
+  mutate(prop_private = num_mutations/num_total)
+print(summary(muts.sc_private$prop_private))
+
+```
+
+## Generate oncoplot
+
+We can provide a visual representation of the OAC-linked driver events which are shared, and deviate, across the single-clonal organoids, bulk organoids, and tissue.
+
+We can begin by loading in coding events (subsetting for OAC drivers), and identifying CNAs in these respective genes
+
+```{r SNV collection}
+
+# Since we will only analyse OAC driver genes, load this gene list
+gene_drivers.file <- read_excel('Data/41588_2018_331_MOESM3_ESM.xlsx',
+                                sheet = 'ST9 All Drivers dnds ratios',
+                                skip = 2)
+gene_drivers <- gene_drivers.file$gene_name
+
+# Load SNV/indel data
+vep.files <- list.files(path = 'Data/WGS/strelka', pattern = '.pass.coding.supplemented.vep$',
+                        recursive = TRUE, full.names = TRUE)
+vep.full <- data.frame()
+
+for (file in vep.files) {
+  
+  if (readLines(file) %>% length > 1) {
+    
+    vep.i <- read.delim(file, skip=1, header = FALSE)
+    
+    if (ncol(vep.i) == 18) { 
+      
+      vep.i <- vep.i[,c(2,3,11,18)]
+      names(vep.i) <- c('sequence_id','mutationID','mutationType','Extra')
+      vep.i <- vep.i %>% dplyr::filter(!duplicated(mutationID))
+      vep.i$Gene <- sapply(vep.i$Extra, function(x)
+        strsplit(strsplit(x,split=';')[[1]][2],split='=')[[1]][2])
+      
+      vep.full <- rbind(vep.full, vep.i[,-4])
+      
+    } else if (ncol(vep.i) == 16) {
+      
+      vep.i <- vep.i[,c(2,3,9,16)]
+      names(vep.i) <- c('sequence_id','mutationID','mutationType','Extra')
+      vep.i <- vep.i %>% dplyr::filter(!duplicated(mutationID))
+      vep.i$Gene <- sapply(vep.i$Extra, function(x)
+        strsplit(strsplit(x,split=';')[[1]][2],split='=')[[1]][2])
+      
+      vep.full <- rbind(vep.full, vep.i[,-4])
+      
+    } else {
+      print(paste0('Check column numbers in file: ',file))
+    }
+    
+  }
+  
+}
+
+# Subset on OAC driver genes
+vep.oac <- vep.full %>% dplyr::filter(Gene %in% gene_drivers)
+vep.oac$sequence_id <- sapply(vep.oac$sequence_id, function(x) strsplit(x,split='_vs_')[[1]][1])
+
+vep.oac <- vep.oac %>%
+  group_by(sequence_id, mutationID, Gene, mutationType) %>% 
+  summarise(Present = 1)
+
+```
+
+Here, we can add the additional OAC-linked coding mutations which were filtered out from the VCF files. In the case of AHM2149, a missense mutation in ZFHX3 (16_72991727) was found in the bulk tissue and two closely-linked clonal organoids, but filtered out of the bulk organoid and two other closely-linked organoids. We can add them back here.
+
+```{r add ZFHX3}
+df.zfhx3 <- read.table('Data/WGS/strelka_checks/strelka_checks_AHM2149_ZFHX3.txt')
+df.zfhx3
+df.zfhx3_add <- data.frame(
+  sequence_id = df.zfhx3$SEQUENCE_ID[df.zfhx3$FILTER != 'PASS'],
+  mutationID = vep.oac$mutationID[vep.oac$Gene == 'ZFHX3'] %>% unique,
+  Gene = 'ZFHX3',
+  mutationType = vep.oac$mutationType[vep.oac$Gene == 'ZFHX3'] %>% unique,
+  Present = 1
+)
+vep.oac <- rbind(vep.oac, df.zfhx3_add)
+```
+
+
+We can repeat data colleciton for CNAs. Here, we use Ensembl to match OAC-linked driver genes with their positions, which are then matched to the respective ASCAT output. Alterations are then highlighted and extracted.
+
+```{r CNA collection}
+# Define copy number files
+files.caveman <- list.files(path = 'Data/WGS/ascat', pattern = '.copynumber.caveman.csv', 
+                            recursive = TRUE, full.names = TRUE)
+files.ploidy <- list.files(path = 'Data/WGS/ascat', pattern = 'samplestatistics.csv', 
+                           recursive = TRUE, full.names = TRUE)
+
+# Define data frame to track ploidy
+df.ploidy <- data.frame()
+
+# In this case, we will start with the gene list and match the copy number profiles
+
+mart <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="https://grch37.ensembl.org", 
+                path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+gene_positions <- getBM(
+  attributes = c('hgnc_symbol','chromosome_name','start_position','end_position'),
+  filters = c('hgnc_symbol'),
+  values = list(gene_drivers),
+  mart=mart
+)
+
+# Define 'by' statement for joining with caveman output
+by = join_by(
+  chromosome_name == Chromosome,
+  start_position >= Start,
+  end_position <= End
+)
+
+# Now we ascribe the CNVs
+cnv.full <- data.frame()
+
+for (i in 1:length(files.caveman)) {
+  
+  seqID.i <- strsplit(strsplit(files.ploidy[i], split='/')[[1]][4], split='_vs_')[[1]][1]
+  ploidy.i <- read.delim(files.ploidy[i],h=F,sep=' ')[2,2]
+  df.ploidy <- rbind(df.ploidy, data.frame(sequence_id = seqID.i,
+                                           ploidy = ploidy.i))
+  
+  caveman.i <- read.csv(files.caveman[i])
+  caveman.i$Chromosome <- as.character(caveman.i$Chromosome)
+  genes.i <- left_join(gene_positions, caveman.i, by)
+  
+  # Label CNVs based on Li, Francies et al. 2018
+  genes.i$CNV <- NA
+  # genes.i$CNV[genes.i$Total_CN >= 1.25*ploidy.i] <- 'Gain'
+  genes.i$CNV[genes.i$Total_CN >= 2*ploidy.i] <- 'Amplification'
+  # genes.i$CNV[genes.i$Total_CN >= 3 & genes.i$hgnc_symbol %in% c('NOTCH1','KCNQ3')] <- 'Amplification'
+  # genes.i$CNV[genes.i$Total_CN <= 0.75*ploidy.i] <- 'Loss'
+  genes.i$CNV[genes.i$Minor_CN == 0] <- 'Loss'
+  genes.i$CNV[genes.i$Total_CN == 0 & genes.i$Minor_CN == 0] <- 'Deletion'
+  
+  genes.i <- genes.i %>% dplyr::filter(!is.na(CNV))
+  
+  if (nrow(genes.i) > 0) {
+    
+    # Extract sequencingID for matching
+    genes.i$sequence_id <- strsplit(strsplit(files.caveman[i], split='/')[[1]][4],split='_vs_')[[1]][1]
+    
+    cnv.full <- rbind(cnv.full, genes.i)
+    
+  }
+  
+}
+
+# Align with vep.oac
+cnv.oac <- cnv.full[,c('sequence_id', 'hgnc_symbol','CNV')]
+names(cnv.oac) <- c('sequence_id','Gene','mutationType')
+
+muts.oac <- rbind(vep.oac[,c('sequence_id','Gene','mutationType')], cnv.oac)
+
+
+```
+
+Now we need to start preparing our data for oncoplotting via ComplexHeatmaps. This involves fixing our mutation-type labels (often these SNVs are assigned multiple definitions), and then preparing our plotting matrix and annotation data frame.
+
+```{r oncoplot preparation}
+
+# Fix mutation type
+muts.oac <- muts.oac %>% dplyr::filter(grepl(pattern = 'missense_variant', mutationType) |
+                                  grepl(pattern = 'frameshift_variant', mutationType) |
+                                  grepl(pattern = 'stop_gained', mutationType) |
+                                  grepl(pattern = 'inframe_', mutationType) |
+                                  grepl(pattern = 'NMD_transcript_variant', mutationType) |
+                                  mutationType %in% c('Deletion','Loss','Amplification'))
+muts.oac$mutationType[grepl(pattern = 'NMD_transcript_variant', muts.oac$mutationType)] <- 'NMD_transcript_variant'
+muts.oac$mutationType[muts.oac$mutationType == 'frameshift_variant,splice_region_variant'] <- 'frameshift_variant'
+muts.oac$mutationType[muts.oac$mutationType == 'missense_variant,splice_region_variant'] <- 'missense_variant'
+
+# Organise data for oncoplot
+#   Group by sequence_id+Gene to generate a single mutationLabel
+
+muts.oac$specimen_source <- 'Single-Cell Derived Organoid'
+muts.oac$specimen_source[muts.oac$sequence_id == 'SLX-21369_SLX-26253.UDP0059'] <- 'Tissue (BO)'
+muts.oac$specimen_source[muts.oac$sequence_id == 'SLX-21369_SLX-26253.UDP0006'] <- 'Bulk Organoid (BO)'
+
+muts.oac_plot <- muts.oac %>%
+  group_by(sequence_id, specimen_source, Gene, mutationType) %>%
+  summarise(Present = n()) %>%
+  group_by(sequence_id, specimen_source, Gene) %>%
+  summarise(mutationLabel = paste(mutationType, collapse=';')) %>%
+  mutate(mutationLabel = paste0(mutationLabel,';'))
+
+# Pivot out to generate a matrix: row = sequence_id, col = Gene
+muts.oac_plot <- muts.oac_plot[,c('sequence_id','Gene','mutationLabel')] %>%
+  pivot_wider(names_from = sequence_id, values_from = mutationLabel) %>%
+  column_to_rownames(var = 'Gene') %>% as.matrix
+muts.oac_plot[is.na(muts.oac_plot)] <- ''
+
+# Prepare annotation file, and set the order of columns (inc.order occams.id by #samples)
+muts.oac_ann <- muts.oac %>%
+  group_by(specimen_source, sequence_id) %>%
+  summarise(driver_count = n())
+
+# Load clinical data and add relevant information
+muts.oac_ann$specimen_source <- factor(muts.oac_ann$specimen_source,
+                                       levels = c('Tissue (BO)', 'Bulk Organoid (BO)', 'Single-Cell Derived Organoid'))
+muts.oac_ann <- muts.oac_ann %>% arrange(specimen_source, desc(driver_count))
+
+muts.oac_plot <- muts.oac_plot[,muts.oac_ann$sequence_id]
+
+
+# Prepare anno_barplot for right_annotation
+annoMut <- muts.oac %>%
+  group_by(Gene, mutationType) %>% summarise(n = n()) %>%
+  pivot_wider(names_from = 'mutationType', values_from = n, values_fill = 0) %>%
+  column_to_rownames(var = 'Gene') %>% as.matrix
+
+# Information for oncoplot input
+col.bars = c("Loss" = "lightblue",
+             'inframe_deletion' = 'orange3', 
+             'missense_variant' = 'red2', 'NMD_transcript_variant' = 'darkgreen')
+alter_fun = list(
+  background = alter_graphic("rect", fill = "gray90"),   
+  Loss = alter_graphic("rect", fill = col.bars["Loss"]),
+  inframe_deletion = alter_graphic("rect", height = 0.33, fill = col.bars["inframe_deletion"]),
+  missense_variant = alter_graphic("rect", height = 0.33, fill = col.bars["missense_variant"]),
+  NMD_transcript_variant = alter_graphic("rect", height = 0.33, fill = col.bars["NMD_transcript_variant"])
+)
+
+# Fix annotation barplot to match colors
+annoMut <- annoMut[,names(col.bars)]
+annoMut <- annoMut[rownames(muts.oac_plot), ]
+
+# Generate oncoplot
+heatmap_legend_param = list(title = "Alterations", at = names(col), labels = names(col))
+
+# Sort column names
+meta.ahm$SampleID_short <- sapply(meta.ahm$`Sample ID`, function(x)
+  str_replace(strsplit(x, split='_')[[1]][2], 'AHM2149.', ''))
+meta.ahm$SampleID_short[meta.ahm$SampleID_short == 'BO'] <- 'BO.bulk'
+meta.ahm$SampleID_short[is.na(meta.ahm$SampleID_short)] <- 'BO.tissue'
+meta.ahm$udp <- sapply(meta.ahm$Index, function(x) strsplit(x, split='[.]')[[1]][3])
+
+muts.oac_ann$udp <- sapply(muts.oac_ann$sequence_id, function(x) strsplit(x,split='[.]')[[1]][2])
+
+muts.oac_ann <- merge(x = muts.oac_ann, y = meta.ahm[,c('udp','SampleID_short')],
+                      by.x = 'udp', by.y = 'udp')
+muts.oac_ann <- muts.oac_ann %>% arrange(specimen_source, desc(driver_count))
+
+colnames(muts.oac_plot) <- muts.oac_ann$SampleID_short
+
+pdf('Results/AHM2149_Oncoplot.pdf', width = 8, height = 5)
+oncoPrint(muts.oac_plot,
+          alter_fun = alter_fun, col = col.bars,
+          top_annotation = HeatmapAnnotation(cbar = anno_oncoprint_barplot(),
+                                             Specimen = muts.oac_ann$specimen_source,
+                                             col = list(cbar = col.bars, 
+                                                        Specimen = c('Tissue (BO)'='blue4','Bulk Organoid (BO)'='blue2',
+                                                                     'Single-Cell Derived Organoid'='gray90'))),
+          right_annotation = rowAnnotation(Specimen = anno_barplot(annoMut, gp = gpar(fill = col.bars))),
+          heatmap_legend_param = heatmap_legend_param,
+          column_order = muts.oac_ann$SampleID_short,
+          # column_order = muts.oac_ann$sequence_id,
+          show_column_names = TRUE)
+dev.off()
+
+# Save coding alterations
+muts.oac <- merge(x = muts.oac, y = muts.oac_ann[,c('sequence_id','SampleID_short')]) %>%
+  dplyr::filter(!(SampleID_short %in% c('BO.tissue','BO.bulk')))
+names(muts.oac)[5] <- 'case_id'
+write.csv(muts.oac, file = 'Results/ClonalOrganoids_AHM2149_codingAlterations.csv')
+
+```
+
+# Phylogenetic and mutational signature analysis
+
+In order to demonstrate patterns of similarity in greater detail, we can use our full set of somatic mutations to determine relationships between clones, and what processes may be connecting them.
+
+## Fitting mutational signatures to bulk-sequence data
+
+As an additional indication of concordance across organoids and tissues, we can fit mutational signatures to the full bulk-sequenced data. Whilst we can eventually match this with our phylogenetic analysis, this should give us an initial indication of interesting patterns, or things to watch out for.
+
+```{r fit signatures to bulk sequences}
+
+# Since we already have the full set of somatic mutations in 'muts.full', we can jump straight in to generating input data for signature fitting.
+
+muts.full$POS <- as.numeric(muts.full$POS)
+muts.full <- muts.full %>%
+  dplyr::filter(CHROM %in% paste0('chr',1:22))
+
+# Generate counts matrices across branches
+sigs.input <- mut.to.sigs.input(
+  mut.ref = muts.full,
+  sample.id = 'SPECIMEN_ID_short',
+  chr = 'CHROM',
+  pos = 'POS',
+  ref = 'REF',
+  alt = 'ALT',
+  bsg = BSgenome.Hsapiens.UCSC.hg19
+)
+
+# Fix signatures matrix and match order to 'sigs.input'
+sigs.hg37 <- read.table('Data/COSMIC_v3.3.1_SBS_GRCh37.txt', header = TRUE)
+rownames(sigs.hg37) <- sigs.hg37$Type; sigs.hg37 <- sigs.hg37[,-1]
+sigs.hg37 <- as.data.frame(t(sigs.hg37))
+sigs.hg37 <- sigs.hg37[,colnames(signatures.cosmic)]
+
+# Define signatures to be fitted
+sigs.include <- paste0('SBS',c(1,2,5,8,13,'17a','17b',18,40))
+
+# Run deconstructSigs
+sigs.complete <- data.frame()
+
+for (sample in rownames(sigs.input)) {
+  # print(sample)
+  sigs.i <- whichSignatures(tumor.ref = sigs.input, 
+                            signatures.ref = sigs.hg37[sigs.include, ],
+                            sample.id = sample,
+                            tri.counts.method = 'default',
+                            contexts.needed = TRUE,
+                            signature.cutoff = 0.02)
+  sigs.complete <- rbind(sigs.complete, sigs.i$weights)
+}
+
+# Determine order of plotting (by decreasing mutation load)
+mut.load <- muts.full %>%
+  group_by(SPECIMEN_ID_short) %>% summarise(total_muts = n()) %>%
+  arrange(desc(total_muts))
+
+# Plotting contribution (signature proportion * total mutations)
+sigs.complete$SPECIMEN_ID_short <- rownames(sigs.complete)
+sigs.complete <- merge(x = sigs.complete, y = mut.load)
+sigs.complete <- sigs.complete %>%
+  pivot_longer(cols = c(SBS1,SBS2,SBS5,SBS8,SBS13,SBS17a,SBS17b,SBS18,SBS40),
+               names_to = 'Signature', values_to = 'Proportion')
+sigs.complete$Contribution <- round(sigs.complete$total_muts * sigs.complete$Proportion)
+sigs.complete$SPECIMEN_ID_short <- factor(sigs.complete$SPECIMEN_ID_short, 
+                                          levels = mut.load$SPECIMEN_ID_short[c(18,21,1:17,19:20)]) # to ensure tissue and bulk organoid are first
+
+ggplot(sigs.complete, aes(x= SPECIMEN_ID_short, y = Contribution, fill = Signature)) + 
+  geom_bar(stat = 'identity') + theme_bw() +
+  scale_fill_manual(values = c('gray70','blue3','orange','orange3',
+                               'purple3','darkblue','gray50','gray30','black')) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  labs(x = '', y = 'Signature Contribution')
+# ggsave(filename = 'Results/AHM2149_signaturesBulk.pdf', height = 4.5)
+
+# Print SBS17a/b proportions for bulk organoid and tissue
+print(paste0('SBS17a/b proportion for bulk organoid: ', 
+             round(100*sum(sigs.complete$Proportion[sigs.complete$SPECIMEN_ID_short == 'BO.bulk' & sigs.complete$Signature %in% c('SBS17a','SBS17b')]),2),'%'))
+print(paste0('SBS17a/b proportion for bulk tissue: ', 
+             round(100*sum(sigs.complete$Proportion[sigs.complete$SPECIMEN_ID_short == 'BO.tissue' & sigs.complete$Signature %in% c('SBS17a','SBS17b')]),2),'%'))
+
+```
+
+We can establish a couple of things from this. Firstly, the single-clonal organoids have broadly higher mutation burdens, which is likely indicative of clonality of SNVs with low VAFs in bulk. Secondly, SBS17 contributions are broadly smaller in the single-clonal organoids than the bulk organoid/tissue.
+
+Before we do phylogenetics, let's summarise our bulk info.
+
+```{r annotation-collate}
+df.anno <- merge(x = df.ploidy, y = df.tmb[,c('sequence_id','TMB')])
+df.anno <- merge(x = df.anno, y = muts.oac_ann[,c('sequence_id','SampleID_short')]) %>%
+  dplyr::filter(!(SampleID_short %in% c('BO.tissue','BO.bulk')))
+names(df.anno)[4] <- 'case_id'
+
+# Collate signature info
+df.sigs <- sigs.complete %>%
+  dplyr::select(SPECIMEN_ID_short, Signature, Proportion) %>%
+  dplyr::filter(Signature %in% c('SBS17a','SBS17b','SBS18','SBS40')) %>%
+  pivot_wider(names_from = 'Signature', values_from = 'Proportion') %>%
+  mutate(SBS17 = SBS17a + SBS17b)
+
+df.anno <- merge(x = df.anno, y = df.sigs, by.x = 'case_id', by.y = 'SPECIMEN_ID_short')
+write.csv(df.anno, file = 'Results/Summary_ClonalOrganoids_AHM2149_annotation.csv')
+```
+
+
+## Phylogenetic analysis
+
+Using the same data for generating the signatures (excluding BO.tissue and BO.bulk), we can also determine the phylogenetic relationships between these organoids, and potentially infer when particular mutational processes were active.
+
+```{r phyloData preparation}
+
+# Remove BO.bulk and BO.tissue from 'muts.full', rotate the table to determine shared mutations across organoids, and define a Root sample with no mutations
+muts.phylo <- muts.full %>% 
+  dplyr::filter(!(SPECIMEN_ID_short %in% c('BO.bulk','BO.tissue'))) %>%
+  mutate(Present = 1) %>% 
+  dplyr::select(MUTATION_ID, SPECIMEN_ID_short, Present) %>%
+  pivot_wider(names_from = SPECIMEN_ID_short, values_from = Present, values_fill = 0) %>%
+  column_to_rownames(var = 'MUTATION_ID') %>% 
+  as.data.frame
+
+muts.phylo <- muts.phylo[,sort(names(muts.phylo))] # this will come in handy when defining branches
+muts.phylo <- cbind(muts.phylo, Root = 0)
+
+# Convert to phyDat object
+muts.phylo_obj <- as.list(muts.phylo)
+muts.phylo_obj <- phyDat(data = muts.phylo_obj, type = 'USER', levels = c(0,1))
+
+```
+
+The tree itself is generated using the parsimony ratchet method, as defined in the phangorn R package.
+
+```{r phylogenetic tree generation}
+
+muts.phylo_treeMP <- pratchet(muts.phylo_obj)
+muts.phylo_treeMP <- root(muts.phylo_treeMP, 'Root', resolve.root = TRUE)
+muts.phylo_treeMP <- acctran(muts.phylo_treeMP, muts.phylo_obj)
+
+p2 <- ggtree(muts.phylo_treeMP) + geom_tiplab()
+print(p2)
+```
+
+## Assigning signatures to branches
+
+Here, signatures are assigned to branches by first assigning mutations to each branch existing on the above tree, and then fitting signatures directly to these. In this way, we can also determine what proportion of mutations are successfully matched to this particular tree.
+
+Each branch is defined by determining all of its downstream tips. Any mutation appearing in each of these tips, and no others, is then assigned to that respective branch.
+
+```{r mutation branch assignment}
+
+# Define a function which returns downstream tips from each node
+node.iterate <- function(data, node.select) {
+  
+  # Daughter nodes of a specific parent node defined by 'node.select'
+  #   This may contain a combination of tips (isTip = TRUE) and branches (isTip = FALSE)
+  #   Iteratively, we replace each case of isTip = FALSE with their respective branches/tips
+  #   Until, for all cases, isTip = TRUE
+  # We then output just the tip nodes
+  df.tips <- data %>% dplyr::filter(parent == node.select)
+  
+  while (sum(df.tips$isTip == FALSE) > 0) { # e.g. if we already are at a tip
+    
+    df.notTip <- df.tips %>% dplyr::filter(!isTip)
+    for (node_tmp in df.notTip$node) {
+      
+      data.node_notTip <- data %>% dplyr::filter(parent == node_tmp)
+      df.tips <- rbind(df.tips, data.node_notTip)
+      
+      df.tips <- df.tips %>% dplyr::filter(node != node_tmp)
+      
+    }
+    
+  } 
+  
+  tip.nodes <- sort(df.tips$label) # again, like previously, this is useful for branch naming/assignment
+  
+  # When there are no tip nodes (i.e. we started with a tip node), we simply output the relevant label for that tip
+  if (length(tip.nodes) == 0) tip.nodes = p2$data$label[p2$data$node == node.select]
+  
+  return(tip.nodes)
+  
+}
+
+# For each node, find the set of tips it is linked with
+df.tip_match <- data.frame(
+  node = p2$data$node,
+  tips = sapply(p2$data$node, function(x) paste(node.iterate(p2$data, x),collapse='_'))
+)
+
+# For each mutation, label with character list of all organoids it is linked with
+#   and check what proportion of mutations fit somewhere on the phylogenetic tree
+muts.phylo$BRANCH <- apply(muts.phylo, 1, function(x) paste(names(x)[x==1], collapse='_'))
+muts.phylo$MUTATION_ID <- rownames(muts.phylo)
+
+# Print the proportion of mutations assigned to a branch defined in 'df.tip_match'
+#   These represent the branches defined in the current tree
+print(paste0('The total proportion of mutations assigned to the inferred tree is: ',
+             round(100*mean(muts.phylo$BRANCH %in% df.tip_match$tips),2),'%'))
+
+
+```
+
+Now that each mutation has been assigned a branch, we can assign signatures too!
+
+```{r signature-branch assignment}
+
+# Group MUTATION_ID for muts.all and match the relevant branch/organoid set
+muts.branch <- muts.full %>%
+  dplyr::filter(!(SPECIMEN_ID_short %in% c('BO.bulk','BO.tissue'))) %>%
+  group_by(MUTATION_ID, CHROM, POS, REF, ALT) %>% summarise()
+muts.branch <- merge(muts.branch, muts.phylo[,c('MUTATION_ID','BRANCH')])
+muts.branch <- muts.branch %>% dplyr::filter(BRANCH %in% df.tip_match$tips)
+
+# Generate counts matrices across branches
+sigs.input <- mut.to.sigs.input(
+  mut.ref = muts.branch,
+  sample.id = 'BRANCH',
+  chr = 'CHROM',
+  pos = 'POS',
+  ref = 'REF',
+  alt = 'ALT',
+  bsg = BSgenome.Hsapiens.UCSC.hg19
+)
+
+# Subset on branches with fewer than 25 mutation
+sigs.input <- sigs.input[apply(sigs.input, 1, sum) >= 25, ]
+
+# Fix signatures matrix
+sigs.hg37 <- read.table('~/Downloads/COSMIC_v3.3.1_SBS_GRCh37.txt', header = TRUE)
+rownames(sigs.hg37) <- sigs.hg37$Type; sigs.hg37 <- sigs.hg37[,-1]
+sigs.hg37 <- as.data.frame(t(sigs.hg37))
+sigs.hg37 <- sigs.hg37[,colnames(signatures.cosmic)]
+
+sigs.include <- paste0('SBS',c(1,2,5,8,13,'17a','17b',18,40))
+
+# Run deconstructSigs
+sigs.complete <- data.frame()
+
+for (sample in rownames(sigs.input)) {
+  print(sample)
+  sigs.i <- whichSignatures(tumor.ref = sigs.input,
+                            signatures.ref = sigs.hg37[sigs.include, ],
+                            sample.id = sample,
+                            tri.counts.method = 'default',
+                            contexts.needed = TRUE,
+                            signature.cutoff = 0.02)
+  sigs.complete <- rbind(sigs.complete, sigs.i$weights)
+}
+
+# Order by node
+sigs.missing <- matrix(0, nrow=length(which(!(df.tip_match$tips %in% rownames(sigs.complete)))),
+                       ncol = ncol(sigs.complete))
+rownames(sigs.missing) <- df.tip_match$tips[which(!(df.tip_match$tips %in% rownames(sigs.complete)))]
+colnames(sigs.missing) <- colnames(sigs.complete)
+
+sigs.complete <- rbind(sigs.complete, sigs.missing)
+
+sigs.complete <- sigs.complete[df.tip_match$tips, ]
+
+# Plot pie charts
+pies = list()
+for (i in 1:nrow(sigs.complete)) {
+  curr_dat = melt(sigs.complete[i,])
+  curr_dat$variable <- factor(curr_dat$variable,
+                              levels = sort(levels(curr_dat$variable)))
+  ## create a ggplot object for each pie chart
+  pies[[i]] =  ggplot(curr_dat, aes(y = value, fill = variable, x="")) +
+    geom_bar(stat = "identity", width = .5) +
+    # coord_polar("y", start=0) +
+    coord_flip() +
+    theme_void() + theme(legend.position = 'none') +
+    scale_fill_manual(values = c('gray90','blue3','orange','orange3',
+                                 'purple3','darkblue','gray50','gray30','black'))
+}
+# give them the appropriate names and plot on tree
+names(pies) = 1:nrow(sigs.complete)
+p2.overlap <- p2 + geom_inset(pies, width = 0.1, height = 0.07,
+                              hjust = 0, x = 'branch') +
+  theme_tree2()
+p2.overlap
+
+ggsave(filename = 'Results/AHM2149_phyloSignatures.pdf', height = 5.5, width = 8.5)
+
+```
+
+# RNA-seq analysis
+
+For our 19 single-clonal organoids, we now use matched RNA-seq data in order to see if those that are ancestrally related also display these similarities transcriptomically. In this case, we will only do basic clustering and check if the mappings match.
+
+```{r rna-seq analysis}
+
+# Load new metadata and filter for clonal organoids (referred here as 'single cell derived organoids') from AHM2149
+meta.rnaseq <- read_excel('Data/Pooled_sequencing_metadata_John Zhuang_RNAseq.xlsx') %>%
+  dplyr::filter(Note == 'Characterization and clustering of phenotypes' &
+                  `Case ID` == 'AHM2149' &
+                  `Specimen phenotype` == "Barrett's" &
+                  `...28` == 'single cell derived organoids') %>%
+  mutate(`Specimen ID` = sapply(`Specimen ID`, function(x) str_replace(x, pattern = 'BE', replacement = 'BO'))) %>%
+  mutate(ID_short = sapply(`Specimen ID`, function(x) 
+    gsub(pattern = 'AHM2149.', replacement = '',strsplit(x,split='_')[[1]][2])),
+    sequence_id = sapply(`Sequencing ID`, function(x) gsub(pattern = '_', replacement = '.', x)))
+
+# Create counts matrix
+counts_list = counts.TPM_list <- list()
+files.rnaseq <- list.files(path = 'Data/RNASeq', full.names = TRUE, pattern = 'rpkm_tpm.txt')
+
+for (file in files.rnaseq) {
+  
+  file.counts <- read.table(file, header = TRUE) # sample info: read counts, FPKM, and TPM
+  
+  # Isolate sequence id
+  sequence_id <- strsplit(strsplit(file, split='/')[[1]][3], split = '__')[[1]][1]
+  
+  # Save read counts in list
+  counts_list[[sequence_id]] <- file.counts$readcounts_union
+  counts.TPM_list[[sequence_id]] <- file.counts$TPM_union
+  
+}
+
+counts <- do.call(bind_cols, counts_list) %>% as.data.frame
+rownames(counts) <- rownames(file.counts) # Ensembl IDs
+names(counts) <- meta.rnaseq$ID_short[match(names(counts), meta.rnaseq$sequence_id)] # sample IDs
+
+counts.TPM <- do.call(bind_cols, counts.TPM_list) %>% as.data.frame
+rownames(counts.TPM) <- rownames(file.counts) # Ensembl IDs
+names(counts.TPM) <- meta.rnaseq$ID_short[match(names(counts.TPM), meta.rnaseq$sequence_id)] # sample IDs
+
+# Generate SummarizedExperiment object
+col_data <- meta.rnaseq[match(names(counts), meta.rnaseq$ID_short), ]
+
+row_data <- ensembldb::select(
+  EnsDb.Hsapiens.v79,
+  keys = rownames(counts), # Ensembl IDs
+  keytype = 'GENEID',
+  columns = c('GENEID','SYMBOL')
+)
+
+counts <- counts[row_data$GENEID, ]
+
+se.ahm2149 <- SummarizedExperiment(assays = as.matrix(counts),
+                                   rowData = row_data, colData = col_data)
+
+# Convert to DESeq object and conduct normalisation, including variance stabilizing transformation
+dds.ahm2149 <- DESeqDataSet(se.ahm2149, design = ~ 1)
+
+dds.ahm2149 <- dds.ahm2149[apply(counts(dds.ahm2149), 1, function(x) mean(x > 50) > .25), ] # remove lowly-expressed genes (i.e less than 25% of organoids have more than 50 reads)
+dds.ahm2149 <- estimateSizeFactors(dds.ahm2149)
+
+vsd.ahm2149 <- vst(dds.ahm2149, blind = FALSE)
+
+# Generate annotation data frame, where we can add genomic info, and CDX2/MUC5AC expression
+anno <- as.data.frame(colData(vsd.ahm2149)[,c('Specimen site', 'Case ID')])
+
+anno$CDX2 = log2(counts.TPM['ENSG00000165556',]+1) %>% as.numeric
+anno$MUC6 = log2(counts.TPM['ENSG00000184956',]+1) %>% as.numeric
+
+anno$Alterations <- NA
+anno$Alterations[rownames(anno) %in% c('BO.15','BO.7')] <- 'FBXW7 loss'
+anno$Alterations[rownames(anno) %in% c('BO.21','BO.6', 'BO.17','BO.2')] <- 'ZFHX3 missense'
+anno$Alterations[rownames(anno) == 'BO.5'] <- 'ARID2 missense'
+anno$Alterations[rownames(anno) == 'BO.11'] <- 'TP53/SMARCA4 missense'
+
+# Generate heatmap with top 500 variable genes
+topVarGenes <- head(order(rowVars(assay(vsd.ahm2149)), decreasing = TRUE), 500)
+mat <- assay(vsd.ahm2149)[topVarGenes, ]
+mat <- mat - rowMeans(mat)
+
+# Generate colours gradient
+paletteLength <- 255
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+myBreaks <- c(seq(min(mat), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+
+pheatmap(mat,
+         annotation_col = anno[,-1],
+         show_rownames = FALSE, show_colnames = TRUE,
+         color = myColor, breaks = myBreaks,
+         main = 'AHM/2149 (NDBO)',
+         clustering_method = 'complete',
+         # filename = 'Results/AHM2149_RNAseqHeatmap.pdf',
+         width = 8, height = 6
+)
+
+
+```
+
+For additional insight, we can take a slightly closer look at our gastric and intestinal markers. Since Barrett's tissue is a mosaic of cells displaying gastric and intestinal phenotypes, one could suggest that these organoids may represent clones which highlight either gastric or intestinal phenotypes.
+
+In this case, whilst BO.25 is displaying a substantial higher CDX2 expression (intestinal marker), in general the expression of MUC5AC (gastric marker) far exceeds the intestinal phenotype.
+
+```{r gastric-intestinal phenotypes}
+# Generate heatmap of TPM-normalised gastric and intestinal markers
+
+TPM.gastric <- counts.TPM[c('ENSG00000215182', # MUC5AC (gastric)
+                            'ENSG00000184956', # MUC6 (gastric)
+                            'ENSG00000165556', # CDX2 (intestinal)
+                            'ENSG00000143167' # GPA33 (intestinal)
+                            ),] %>% as.data.frame
+rownames(TPM.gastric) <- c('MUC5AC','MUC6','CDX2','GPA33')
+TPM.gastric <- log2(TPM.gastric + 1)
+
+pheatmap(TPM.gastric,
+         # color = myColor, breaks = myBreaks,
+         main = 'AHM/2149 (NDBO) - Gastric/Intestinal Markers',
+         filename = 'Results/AHM2149_RNAseq_HeatmapMarkers.pdf',
+         width = 5, height = 3.5)
+
+# Note a marginal negative association between CDX2 and MUC6, and how MUC5AC deviates from what may be expected
+df.marker_plot <- data.frame(
+  sample_id = colnames(TPM.gastric),
+  CDX2 = as.numeric(TPM.gastric['CDX2',]),
+  MUC6 = as.numeric(TPM.gastric['MUC6', ])
+)
+
+ggplot(df.marker_plot, aes(x = CDX2, y = MUC6, label = sample_id)) + theme_bw() +
+  geom_point() +
+  geom_smooth(method = 'lm') + stat_cor(label.y.npc = 'bottom') +
+  labs(x = 'CDX2 (log2-TPM)', y = 'MUC6 (log2-TPM)') +
+  geom_text_repel()
+ggsave(filename = 'Results/AHM2149_RNAseq_GastricIntestinal.pdf')
+
+```
+
+We can also run our gastric/intestinal panels to see how they compare. Whilst we would ideally have liked to compare these values with our bulk normal gastric and intestinal organoids, these were not sequenced in the same batch, and so comparing would be a bit irresponsible
+
+
+```{r calculate gene set enrichment scores}
+
+# Define our gastric and intestinal gene panels
+genes.gastric <- c('MUC6','MUC5AC','CLDN18','PGC','GKN1','GKN2')
+genes.intestinal <- c('MUC2','TFF3','REG4','GPA33','CDX2','FABP2','OLFM4','ANPEP')
+
+# Extract relevant gene expression matrix and fix gene IDs
+row_data.removeDups <- row_data %>% dplyr::filter(!duplicated(SYMBOL))
+counts.TPM <- counts.TPM[row_data.removeDups$GENEID, ]
+rownames(counts.TPM) <- row_data.removeDups$SYMBOL
+
+# Build GSVA parameter object, and call gsva for ssGSEA (single-set gene-set enrichment analysis)
+gsvaPar <- ssgseaParam(as.matrix(counts.TPM), geneSets = list(Gastric = genes.gastric, Intestinal = genes.intestinal))
+gsva.sigs <- gsva(gsvaPar, verbose = FALSE) %>% t %>% as.data.frame
+
+# Plot labels
+gsva.sigs$Label <- sapply(rownames(gsva.sigs), function(x)
+  ifelse(grepl(pattern = 'BO', x), 'BO',
+         ifelse(grepl(pattern = 'DE',x), 'Gastric', 'Intestinal')))
+  
+# Collate plot
+gsva.sigs$sample_ID = rownames(gsva.sigs)
+ggplot(gsva.sigs, aes(x = Intestinal, y = Gastric, label = sample_ID)) + 
+  theme_bw() + geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  scale_color_manual(values = c('darkgreen','green3',
+                                'blue',
+                                'red2','red4')) +
+  labs(x = 'Intestinal Gene Score', y = 'Gastric Gene Score') +
+  geom_text_repel() + coord_obs_pred()
+ggsave(filename = 'Results/AHM2149_RNAseq_GastricIntestinalScores.pdf')
+
+```
+

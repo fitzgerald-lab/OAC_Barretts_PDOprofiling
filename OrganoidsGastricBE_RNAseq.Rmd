@@ -1,0 +1,1016 @@
+---
+title: "RNA-seq Analysis of BO and normal gastric/intestinal organoids"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "2025-05-27"
+---
+
+In this script, we shall conduct RNA-seq analysis on the full set of data obtained from out Barrett's (NDBO and Dysplastic), and normal (gastric and intestinal) organoids. From this, we can aim to determine:
+
+* The phenotypic identity of our Barrett's organoids. Whilst Barrett's oesophagus is defined by the replacement of the (gastric-like) squamous lining with an (intestinal-like) columnar epithelium, previous analysis (Nowicki-Osuch, Zhuang et al. 2023) stipulates that Barrett's oesophagus represents a mosaic of cells displaying gastric and intestinal identites. We would like to determine if our organoids span these phenotypes.
+* Dysplastic features in our Barrett's organoids. Whilst dysplastic BO is generally defined by a more oncogenic phenotype (e.g. TP53 loss, additional chromosomal instability, increased likelihood of progression), our dysplastic BO organoids tend not to display hugely altered genomic profiles, potentially demonstrating the tendency for currently-established organoid-growth techniques to favour 'normal' cells. Here, we can check these instances.
+* The pathway alterations which drive the trajectory from normal gastric to Barrett's phenotype. In particular, whether these differences are observed when differentiating between non-dysplastic and dysplastic Barrett's may highlight early-cancer driver alterations.
+
+```{r load libraries, message = FALSE}
+library(readxl) # read Excel files
+library(tidyverse) # data table manipulation
+library(EnsDb.Hsapiens.v79) # for gene information
+library(SummarizedExperiment) # for SummarizedExperiment object generation
+library(DESeq2) # differential expression analysis
+library(pheatmap) # heatmap plotting
+library(GSVA) # gene set variation analysis
+library(RColorBrewer) # colour definition
+library(ggplot2) # plotting
+library(ggpubr) # nice plotting
+library(rstatix) # for printing adjusted p-values
+library(ggrepel) # for gene labelling on volcano plots
+library(clusterProfiler) # GO analysis from DGE
+library(gprofiler2) # functional enrichment analysis
+library(ggupset) # upset plot for shared DEGs
+library(fgsea) # fast gene set enrichment analysis
+library(ensembldb) # gene information
+library(org.Hs.eg.db) # Homo sapiens gene info database
+library(patchwork) # for organising plots
+```
+
+# Unsupervised analysis
+
+## Collate metadata
+
+To begin, we can collate our full set of transcriptomic data. Since our current set contains additional OAC organoids, we use our metadata to define the correct organoids, on which we can subsequently subset our full set of data.
+
+```{r collate metadata}
+
+# Load metadata (this only contains normal and BO organoids - the remainder of the cohort is OAC)
+meta <- read_excel('Data/Pooled_sequencing_metadata_John Zhuang_RNAseq.xlsx') %>%
+  dplyr::filter(grepl(pattern = 'SLX-19631', `Sequencing ID`) & # correct sequencing batch
+                  (`...28` != 'single cell derived organoids' | is.na(`...28`)) # filter on organoids from other experiments
+                ) %>%
+  mutate(sequence_id = sapply(index, function(x) paste0('SLX-19631.',x))) # to match with our sequencing data
+
+# Sort the Englishisms
+meta$`Tissue/Organoid Grade` <- sapply(meta$`Tissue/Organoid Grade`, function(x) str_replace(x,'BE','BO'))
+meta$`Specimen ID` <- sapply(meta$`Specimen ID`, function(x) str_replace(x,'BE','BO'))
+
+# Define the specific categories
+meta$Label <- NA
+meta$Label[meta$`Specimen site` %in% c('Intestine (duodenum)', 'Intestine (Jejunum)')] <- 'NormalIntestine'
+meta$Label[meta$`Tissue/Organoid Grade` == 'BO (IM)'] <- 'NDBO'
+meta$Label[meta$`Tissue/Organoid Grade` %in% c('BO (HGD)','BO (LGD)','BO (LGD/HGD)')] <- 'DysplasticBO'
+meta$Label[meta$`Tissue/Organoid Grade` == 'Normal donor'] <- 'NormalGastric_Healthy'
+meta$Label[is.na(meta$Label) &
+             meta$`Specimen site` != 'Oesophagus' &
+             meta$`Tissue/Organoid Grade` != 'GIM'] <- 'NormalGastric_Patient'
+
+# Relabel AHM0593 and remove P4 (no matched WGS)
+meta$Label[meta$`Case ID` == 'AHM0593'] <- 'DysplasticBO'
+meta <- meta %>% filter(sequence_id != 'SLX-19631.7006')
+
+meta <- meta %>% dplyr::filter(!is.na(Label)) # removes a sole OAC (T1) organoid and 2x GIM organoids
+
+meta$Label %>% table
+
+```
+
+## Collate counts data
+
+Now that we have defined the organoids to be extracted, we can now collate all of our transcriptomic data, and subset on it to specifically highlight BO and normal organoids.
+
+```{r SummarizedExperiment object generation}
+# Create counts matrices (raw and TPM)
+#   Include sequence_id as a column name
+#   These will eventually be replaced by matched specimen IDs
+counts_list <- counts.TPM_list <- list()
+files.rnaseq <- list.files(path = 'Data', full.names = TRUE, pattern = 'rpkm_tpm.txt')
+
+for (file in files.rnaseq) {
+  
+  file.counts <- read.table(file, header = TRUE)
+  
+  # Isolate specimen ID
+  file.sequence_id <- strsplit(strsplit(file, split='/')[[1]][2], split='__')[[1]][1]
+  
+  # Add to counts lists
+  counts_list[[file.sequence_id]] <- file.counts$readcounts_union
+  counts.TPM_list[[file.sequence_id]] <- file.counts$TPM_union
+  
+}
+
+# Collate lists into count matrices (and specifically extract those in meta$sequence_id)
+counts <- do.call(bind_cols, counts_list[meta$sequence_id]) %>% as.matrix
+counts.TPM <- do.call(bind_cols, counts.TPM_list[meta$sequence_id]) %>% as.matrix
+
+# Add rownames(genes)
+rownames(counts) <- rownames(file.counts)
+rownames(counts.TPM) <- rownames(file.counts)
+
+# Generate col_data and row_data, for eventual collation into a SummatizedExperiment object
+col_data <- meta %>% dplyr::select('sequence_id','Case ID','Label','Specimen site','Passage') %>% as.data.frame
+names(col_data)[2] <- 'CaseID'
+rownames(col_data) <- col_data$sequence_id
+
+row_data <- ensembldb::select(
+  EnsDb.Hsapiens.v79,
+  keys = rownames(counts),
+  keytype = 'GENEID',
+  columns = c('GENEID','SYMBOL')
+)
+counts <- counts[row_data$GENEID,]
+counts.TPM <- counts.TPM[row_data$GENEID, ]
+
+# Create SummarizedExperiment object
+se <- SummarizedExperiment(assays = list(counts = counts, counts.TPM = counts.TPM),
+                           rowData = row_data, colData = col_data)
+
+```
+
+## Clustering
+
+As an unbiased approach to determining Barrett's phenotype, we apply a PCA and unsupervised clustering on these organoids using a set of most variable genes.
+
+```{r unsupervised clustering}
+# Create DESeq2 object
+dds <- DESeqDataSet(se, design = ~ Label) # Label = normal gastric/intestine and (non-)dysplastic BO
+
+# Remove lowly-expressed genes and estimate size factors
+dds <- dds[apply(counts(dds), 1, function(x) mean(x>50)>.25), ] # remove genes with <50 reads in >25% organoids
+dds <- estimateSizeFactors(dds)
+
+# Variance stabilising transformation
+vsd <- vst(dds, blind = FALSE)
+
+# Define plotting labels
+vsd$plotLabel <- vsd$Label %>% as.character
+vsd$plotLabel[vsd$Label == 'DysplasticBO'] <- 'Barretts (Dysplastic)'
+vsd$plotLabel[vsd$Label == 'NDBO'] <- 'Barretts (NDBO)'
+vsd$plotLabel[vsd$Label == 'NormalGastric_Healthy'] <- 'Normal (Healthy)'
+vsd$plotLabel[vsd$Label == 'NormalGastric_Patient'] <- 'Normal (Patient)'
+vsd$plotLabel[vsd$Label == 'NormalIntestine'] <- 'Intestinal'
+
+pdf('Results/Organoids_GastricBO_PCA.pdf', height = 8, width = 8)
+plotPCA(vsd, intgroup = 'plotLabel') + theme_bw() +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  scale_color_manual(values = c('darkgreen','green3',
+                                'blue',
+                                'red2','red4'))
+dev.off()
+
+# Heatmap
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 1000)
+mat <- assay(vsd)[topVarGenes, ]
+mat <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd))
+anno$Passage <- sapply(anno$Passage, function(x) as.numeric(substr(x,2,nchar(x))))
+
+paletteLength <- 255
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(mat), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+names(anno)[c(4,7)] <- c('Specimen Site', 'Type')
+
+ann_colors <- list(
+  `Specimen Site` = c(`Gastric antrum` = 'yellow', `Gastric body` = 'gold', `Gastric body or cardia` = 'orange', `Gastric cardia` = 'chocolate',`GOJ` = 'brown', `Intestine (duodenum)` = 'mediumorchid4', `Intestine (Jejunum)` = 'purple', Oesophagus = 'pink'),
+  Type = c(Intestinal = 'blue', `Normal (Healthy)` = 'red2', `Normal (Patient)`= 'red4',
+            `Barretts (NDBO)` = 'green3', `Barretts (Dysplastic)` = 'darkgreen')
+  
+)
+
+pheatmap(mat, annotation_col = anno[,c(7,4,6)], show_rownames = FALSE, show_colnames = FALSE,
+         color = myColor, breaks = myBreaks,
+         annotation_colors = ann_colors,
+         # filename = 'Results/Organoids_GastricBO_Heatmap.pdf',
+         height = 6.5)
+
+
+```
+
+From this analysis, we can clearly see that there is shared clustering of the Barrett's and intestinal organoids, reflect the established Barrett's phenotype as well as the developmental deviations made from gastric to Barrett's states. It should be noted that, given only three intestinal organoids, it is unsurprising that the genes which enable the greatest variation are those which separate Barrett's and gastric organoids.
+
+## Gastric and intestinal markers
+
+As an additional indicator of gastric/intestinal phenotypes within the Barrett's organoids, we can compare established transcriptional markers.
+
+```{r gastric and intestinal markers in Barretts}
+# Extract TPM-normalised counts for established gastric and intestinal markers and compare
+df.markers <- data.frame(
+  Label = vsd$plotLabel,
+  Site = se$`Specimen site`,
+  CDX2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'CDX2'),]+1),
+  GPA33 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'GPA33'),]+1),
+  MUC5AC = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC5AC'),]+1),
+  MUC6 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC6'),]+1)
+)
+ggplot(df.markers, aes(x = CDX2, y = MUC5AC, color = Label)) + 
+  theme_bw() + geom_point() + ylim(0,12) +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  labs(x = 'CDX2 (log2-TPM)', y = 'MUC5AC (log2-TPM)')  +
+  scale_color_manual(values = c('darkgreen','green3',
+                                'blue',
+                                'red2','red4'))
+ggsave(filename = 'Results/Organoids_GastricBO_MUC5ACvsCDX2.pdf',
+       width = 5, height = 5)
+
+# Calculate Z-scores for each gene and generate heatmap
+mat <- t(df.markers[,3:6])
+mat <- mat - rowMeans(mat)
+
+pheatmap(mat, annotation_col = df.markers[,1:2],
+         show_colnames = FALSE, cutree_cols = 3, cutree_rows = 2,
+         color = myColor, breaks = myBreaks,
+         filename = 'Results/Organoids_GastricBO_GastricIntestinalMarkers.pdf',
+         height = 4)
+
+```
+
+A broader way to validate the varying gastric/intestinal phenotypes would be a gene-set enrichment analysis on a more complete panel of gastric and intestinal-related genes
+
+```{r GSVA gastric and intestinal phenotypes}
+# Define our gastric and intestinal gene panels
+genes.gastric <- c('MUC6','MUC5AC','CLDN18','PGC','GKN1','GKN2')
+genes.intestinal <- c('MUC2','TFF3','REG4','GPA33','CDX2','FABP2','OLFM4','ANPEP')
+
+# Extract relevant gene expression matrix
+# se.sigs <- se[rowData(se)$SYMBOL %in% c(genes.gastric, genes.intestinal), ]
+se.sigs <- se
+mat.sigs <- assay(se.sigs, 'counts.TPM')
+rownames(mat.sigs) <- rowData(se.sigs)$SYMBOL
+mat.sigs <- mat.sigs[!duplicated(rownames(mat.sigs)), ]
+
+# Build GSVA parameter object, and call gsva for ssGSEA (single-set gene-set enrichment analysis)
+gsvaPar <- ssgseaParam(mat.sigs, geneSets = list(Gastric = genes.gastric, Intestinal = genes.intestinal))
+gsva.sigs <- gsva(gsvaPar, verbose = FALSE) %>% t %>% as.data.frame
+
+# Plot labels
+gsva.sigs <- merge(x = gsva.sigs, y = df.markers[,c('Site','Label')], by = 0) %>%
+  column_to_rownames(var = 'Row.names')
+
+# Collate plot
+ggplot(gsva.sigs, aes(x = Intestinal, y = Gastric, color = Label)) + 
+  theme_bw() + geom_point() +
+  scale_color_manual(values = c('darkgreen','green3',
+                                'blue',
+                                'red2','red4')) +
+  labs(x = 'Intestinal Gene Score', y = 'Gastric Gene Score')
+ggsave(filename = 'Results/Organoids_GastricBO_ssGSEAGastricvsIntestinal.pdf', width = 7, height =7.5)
+
+
+```
+
+And plotting a full heatmap of the two gene panels...
+
+```{r bigger heatmap}
+mat <- log2(mat.sigs[c(genes.gastric, genes.intestinal),] + 1)
+mat <- mat - rowMeans(mat)
+
+ann.genes <- data.frame(Gene = c(genes.gastric, genes.intestinal),
+                        Panel = c(rep('Gastric',length(genes.gastric)), rep('Intestinal',length(genes.intestinal)))) %>%
+  column_to_rownames(var = 'Gene')
+ann_colors <- list(
+  Panel = c(Gastric = 'darkgreen', Intestinal = 'orange2'),
+  Label = c(Intestinal = 'blue', `Normal (Healthy)` = 'red2', `Normal (Patient)`= 'red4',
+            `Barretts (NDBO)` = 'green3', `Barretts (Dysplastic)` = 'darkgreen')
+)
+
+pheatmap(mat, annotation_col = df.markers[,c(1,3)], annotation_row = ann.genes,
+         show_colnames = FALSE, cutree_cols = 4, cutree_rows = 2,
+         color = myColor, breaks = myBreaks,
+         annotation_colors = ann_colors,
+         filename = 'Results/Organoids_GastricBO_GastricIntestinalMarkers.pdf',
+         height = 4)
+```
+
+
+From this, we can see that Barrett's organoids hold an intermediate space between the gastric and intestinal phenotypes, with significantly increased intestinal marker expression, and steadily decreasing mucin expression.
+
+# Differential Expression Analysis
+
+Having established that our Barrett's organoids exist on the gastric-intestinal trajectory that would be expected, we can then begin to compare how these groups differ, in particular the Barrett's organoids which we have defined as dysplasic or non-dysplastic.
+
+## NDBO vs Normal Gastric
+
+To start, we can compare our non-dysplastic (n=11) to normal gastric (n=26) organoids. It should be noted that our normal gastric organoids also deisplay a fair amount of heterogeneity, in particular with relation to GOJ vs gastric cardia, but as demonstrated above, for now we can consider these normal gastric with relation to our Barrett's organoids.
+
+```{r NDBO vs gastric: DGE}
+
+# Define requisite data and conduct preprocessing
+se$Label[se$Label %in% c('NormalGastric_Healthy','NormalGastric_Patient')] <- 'NormalGastric'
+
+se.ndbe <- se[,se$Label %in% c('NDBO','NormalGastric')]
+se.ndbe$Label <- factor(se.ndbe$Label, levels = c('NormalGastric','NDBO'))
+
+dds.ndbe <- DESeqDataSet(se.ndbe, design = ~ Label)
+dds.ndbe <- dds.ndbe[apply(counts(dds.ndbe), 1, function(x) mean(x > 100) > .1), ] # Given the unbalanced datasets, we deem it necessary to be slightly less stringent with respect to lowly-expressed genes
+dds.ndbe <- estimateSizeFactors(dds.ndbe)
+
+# We note that three cases have matched normal and NDBO organoids. Including `Case ID` as a covariate here would remove the contribution of the other 31 unmatched organoids, and so we will not include this as a covariate. We can show via PCA that these organoids do not cluster by case anyway, and so the variability is maintained.
+vsd.ndbe <- vst(dds.ndbe, blind = FALSE)
+vsd.ndbe$label_check <- vsd.ndbe$Label %>% as.character
+
+vsd.ndbe$label_check[vsd.ndbe$CaseID == 'AHM1373'] <- 'AHM1373'
+vsd.ndbe$label_check[vsd.ndbe$CaseID == 'AHM0040'] <- 'AHM0040'
+vsd.ndbe$label_check[vsd.ndbe$CaseID == 'AHM1678'] <- 'AHM1678'
+
+plotPCA(vsd.ndbe, intgroup = 'label_check') + theme_bw() +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  scale_color_manual(values = c('darkred','darkgreen','navy','gray60','gray80'))
+
+# Differential expression analysis
+dds.ndbe <- DESeq(dds.ndbe)
+res.ndbe <- results(dds.ndbe) %>% as.data.frame
+
+# Visualise results
+res.ndbe$logP <- -log10(res.ndbe$padj)
+
+res.ndbe$label <- 'NS'
+res.ndbe$label[res.ndbe$padj < .05] <- 'p-val'
+res.ndbe$label[abs(res.ndbe$log2FoldChange) > 1] <- 'log2fc'
+res.ndbe$label[res.ndbe$padj < .05 &
+               abs(res.ndbe$log2FoldChange) > 1] <- 'both'
+res.ndbe$label <- factor(res.ndbe$label, 
+                       levels = c('NS','p-val','log2fc','both'))
+
+res.ndbe$GeneID <- ensembldb::select(EnsDb.Hsapiens.v79,
+                                     keys = rownames(res.ndbe),
+                                     keytype = 'GENEID',
+                                     columns = 'SYMBOL')[,'SYMBOL']
+res.ndbe <- res.ndbe %>% arrange(padj)
+res.ndbe$GeneID[21:nrow(res.ndbe)] <- NA
+
+ggplot(res.ndbe, aes(x = log2FoldChange, y = logP, label = GeneID)) + 
+  theme_bw() +
+  geom_point(aes(col = label)) +
+  scale_color_manual(values = c('grey90','orange','yellow3','red')) +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  geom_text_repel() +
+  labs(x = 'log2 Fold Change', y = '-log10(adjusted p-value)')
+# ggsave(filename = 'Results/DGE_NDBOvsGastric.pdf', width = 6.5, height = 6)
+
+```
+
+From our initial comparison of NDBO vs normal gastric, we observe significant upregulation of multiple HOX genes, which have previously been highlighted as drivers of the Barrett's trajectory via triggering of intestinal differentiation (di Pietro et al. 2012). To supplement this, we can conduct gene ontology analysis on our differential expression results, which can be conducted using clusterProfiler.
+
+```{r NDBO vs gastric: functional analysis}
+# Order all genes by decreasing log2FoldChange
+original_gene_list <- res.ndbe$log2FoldChange
+names(original_gene_list) <- rownames(res.ndbe)
+gene_list <- sort(original_gene_list, decreasing = TRUE)
+
+# Gene ontology analysis
+gse.ndbe <- gseGO(geneList = gene_list,
+             ont = 'BP',
+             keyType = 'ENSEMBL',
+             # nPerm = 10000,
+             verbose = TRUE,
+             OrgDb = 'org.Hs.eg.db',
+             pAdjustMethod = 'fdr',
+             pvalueCutoff = 1,
+             by = 'fgsea')
+dotplot(gse.ndbe, showCategory = 10, split = '.sign') + facet_grid(.~.sign)
+ggsave(filename = 'Results/DGE_NDBOvsGastric_GeneOntology.pdf')
+
+
+```
+
+Primarily, we observe activation of embryogenetic and morophogenic pathways, as indicated by HOX gene upregulation, and downregulation of metabolic processes, in the NDBO organoids.
+
+## Dysplastic BO vs Normal Gastric
+
+Now we conduct the same analysis on our dysplastic BO (n=4) organoids. It is worth clarifying both the decreased sample size, as well as the potentially non-dysplastic phenotype of some organoids as usggested by our genetic analysis. 
+
+```{r Dysplastic BO vs gastric: DGE}
+
+# Define requisite data and conduct preprocessing
+se.dys <- se[,se$Label %in% c('DysplasticBO','NormalGastric')]
+se.dys$Label <- factor(se.dys$Label, levels = c('NormalGastric','DysplasticBO'))
+
+dds.dys <- DESeqDataSet(se.dys, design = ~ Label)
+dds.dys <- dds.dys[apply(counts(dds.dys), 1, function(x) mean(x > 100) > .1), ]
+dds.dys <- estimateSizeFactors(dds.dys)
+
+# Differential Expression analysis
+dds.dys <- DESeq(dds.dys)
+res.dys <- results(dds.dys) %>% as.data.frame
+
+# Visualise results
+res.dys$logP <- -log10(res.dys$padj)
+
+res.dys$label <- 'NS'
+res.dys$label[res.dys$padj < .05] <- 'p-val'
+res.dys$label[abs(res.dys$log2FoldChange) > 1] <- 'log2fc'
+res.dys$label[res.dys$padj < .05 &
+                 abs(res.dys$log2FoldChange) > 1] <- 'both'
+res.dys$label <- factor(res.dys$label, 
+                         levels = c('NS','p-val','log2fc','both'))
+
+res.dys$GeneID <- ensembldb::select(EnsDb.Hsapiens.v79,
+                                     keys = rownames(res.dys),
+                                     keytype = 'GENEID',
+                                     columns = 'SYMBOL')[,'SYMBOL']
+res.dys <- res.dys %>% arrange(padj)
+res.dys$GeneID[21:nrow(res.dys)] <- NA
+
+ggplot(res.dys, aes(x = log2FoldChange, y = logP, label = GeneID)) + 
+  theme_bw() +
+  geom_point(aes(col = label)) +
+  scale_color_manual(values = c('grey90','orange','yellow3','red')) +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  geom_text_repel() +
+  labs(x = 'log2 Fold Change', y = '-log10(adjusted p-value)')
+ggsave(filename = 'Results/DGE_DysplasticBOvsGastric.pdf', width = 6.5, height = 6)
+
+```
+
+Again, we observe the significant upregulation of multiple HOX genes, demonstrating the true Barrett's identity of these organoids. We should also point out that there appears to be a general tendency towards downregulation across some genes.
+
+
+```{r Dysplastic BO vs gastric: functional analysis}
+# Order all genes by decreasing log2FoldChange
+original_gene_list <- res.dys$log2FoldChange
+names(original_gene_list) <- rownames(res.dys)
+gene_list <- sort(original_gene_list, decreasing = TRUE)
+
+# Gene ontology analysis
+gse.dys <- gseGO(geneList = gene_list,
+             ont = 'BP',
+             keyType = 'ENSEMBL',
+             # nPerm = 10000,
+             verbose = TRUE,
+             OrgDb = 'org.Hs.eg.db',
+             pAdjustMethod = 'fdr',
+             pvalueCutoff = 1,
+             by = 'fgsea')
+dotplot(gse.dys, showCategory = 10, split = '.sign') + facet_grid(.~.sign)
+ggsave(filename = 'Results/DGE_DysplasticBOvsGastric_GeneOntology.pdf',
+       width = 7, height = 7)
+
+```
+
+## Dysplastic BO vs NDBO
+
+Finally, given the deviations suggested here, it would be amiss to not directly compare the two sets of Barrett's organoids.
+
+```{r Dysplastic BO vs NDBO: profiling}
+# Define requisite data and condcut preprocessing
+se.bo <- se[,se$Label %in% c('DysplasticBO','NDBO')]
+se.bo$Label <- factor(se.bo$Label, levels = c('NDBO','DysplasticBO'))
+
+dds.bo <- DESeqDataSet(se.bo, design = ~ Label)
+dds.bo <- dds.bo[apply(counts(dds.bo), 1, function(x) mean(x > 100) > .1), ]
+dds.bo <- estimateSizeFactors(dds.bo)
+
+# Compute a variance stabilizing transformation and PCA
+vsd.bo <- vst(dds.bo, blind = FALSE)
+
+plotPCA(vsd.bo, intgroup = 'Label') + theme_bw() +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  scale_color_manual(values = c('gold3','blue3'))
+ggsave(filename = 'Results/Organoids_DysplasticVsNDBO_PCA.pdf')
+```
+Intriguingly, it appears that low PC2 values are associated with dysplasia. We can show this through a Wilcoxon rank sum test, as well as through some permutation testing to elicit how strong this association is
+
+```{r PC2 and dysplasia}
+# Redo PCA and save values
+p_data <- plotPCA(vsd.bo, intgroup = 'Label')$data %>%
+  mutate(Label = as.character(Label))
+
+ggboxplot(p_data, x = 'Label', y = 'PC2', color = 'Label', add = 'jitter') +
+  stat_compare_means()
+
+# Permutation testing for PC2 ~ dysplasia
+
+seed = 101
+nsim = 9999
+
+set.seed(seed)
+
+output.perms <- vector(length = nsim)
+
+# For each simulation, resample PC2 and recalculate mean(DysplasticBO) - mean(NDBO)
+for (i in 1:nsim) {
+  perm.i = sample(1:nrow(p_data))
+  p_data.i <- p_data %>%
+    mutate(PC2 = PC2[perm.i])
+  
+  output.perms[i] <- mean(p_data.i$PC2[p_data.i$Label == 'DysplasticBO']) -
+    mean(p_data.i$PC2[p_data.i$Label == 'NDBO'])
+}
+
+# Add true difference in means
+obs <- mean(p_data$PC2[p_data$Label == 'DysplasticBO']) -
+  mean(p_data$PC2[p_data$Label == 'NDBO'])
+output.perms <- c(output.perms, obs)
+
+hist(output.perms, col = 'gray', las = 1, main = 'Differences in Mean PC2 contributions across 10,000 permutations', xlab = '')
+abline(v = obs, col = 'red')
+
+# Report proportion of permutations with greater mean difference than the true value
+pval = mean(abs(output.perms) >= abs(obs))
+print(paste0('Proportion of permutations with stronger diffeences than observed: ', pval))
+
+```
+
+This also raises the question of which gene are contributing to PC2. Specifically, do these offer any indication about the gastric/intestinal features presented by these organoids?
+
+```{r drivers of PC2}
+
+# Rerun PCA (here we use top 1000 variable genes to increase likelihood of including gastric and intestinal panel genes)
+assay.vsd <- assay(vsd.bo)
+var.genes <- rowVars(assay.vsd) %>% sort(decreasing = TRUE)
+assay.vsd <- assay.vsd[names(var.genes[1:1000]), ]
+p <- prcomp(t(assay.vsd))
+
+# Extract PC2 contributions and highlight gastric/intestinal genes
+pc2_contributions <- data.frame(
+  GENEID = rownames(p$rotation),
+  PC2_rotation = p$rotation[,'PC2']
+)
+
+pc2_contributions <- merge(x = pc2_contributions,
+                           y = as.data.frame(rowData(vsd)[,c('GENEID','SYMBOL')]))
+pc2_contributions$Label <- sapply(pc2_contributions$SYMBOL, function(x)
+  ifelse(x %in% genes.gastric, 'Gastric',
+         ifelse(x %in% genes.intestinal, 'Intestinal', 'NA')))
+pc2_contributions <- pc2_contributions %>%
+  arrange(PC2_rotation) %>% mutate(SYMBOL = factor(SYMBOL, levels = SYMBOL))
+
+ggplot(pc2_contributions, aes(x = SYMBOL, y = PC2_rotation, fill = Label)) + theme_bw() +
+  geom_bar(stat = 'identity') + labs(x = 'Top 1000 Variable Genes', y = 'PC2 loading') +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = 'top', legend.title = element_blank()) +
+  scale_fill_manual(values = c('blue3','red2','gray90'))
+
+```
+
+Intriguingly, 5/8 of our intestinal gene panel contribute negatively to PC2, and 4/6 of our gastric gene panel contribute positively. This implies that our dysplastic organoids - defined here by low PC2 values, are characterised by increased intestinal expression. This could be somewhat counter-intuitive, given how dysplasia is partially defined by this loss of metaplastic identity, defined as it is by intestinal features. However, recent analysis has shown the maintenance of intestinal markers (e.g. REG4) right through to undifferentiated-type OAC, suggesting that perhaps these intestinal markers are not just indicating dysplasia, but possibly a tendency for progression.
+
+Finally, before cracking on with the direct differential expression analysis, we can also extend our investigation beyond gastric/intestinal markers, and see how our ranking of PC2 contribution matches with cancer hallmark gene sets, to see if our dysplastic organoids give any indication of pre-cancerous tendencies. For this, we use the fast gene set enrichment analysis (fgsea) tool.
+
+```{r hallmark gene set enrichment}
+# Load our Hallmark gene sets
+load('~/Downloads/human_H_v5p2.rdata')
+
+# Add EntrezIDs to our gene list pre-ordered by PC2 contribution
+entrezid <- mapIds(
+  org.Hs.eg.db,
+  keys = as.character(pc2_contributions$SYMBOL),
+  keytype = 'SYMBOL',
+  column = 'ENTREZID')
+pc2_contributions$ENTREZID <- entrezid
+pc2_contributions <- pc2_contributions %>% filter(!is.na(ENTREZID))
+
+# Run fgsea
+ranks <- pc2_contributions$PC2_rotation
+names(ranks) <- pc2_contributions$ENTREZID
+# barplot(sort(ranks, decreasing = TRUE))
+
+fgseaRes <- fgsea(pathways=Hs.H, stats=ranks, minSize = 15, maxSize = 500)
+fgseaRes_order <- fgseaRes %>% 
+  arrange(NES) %>%
+  dplyr::filter(padj < .05) %>%
+  mutate(pathway = factor(pathway, levels = pathway))
+
+# Plot significant results
+ggplot(fgseaRes_order, aes(x = NES, y = pathway, fill = padj)) + 
+  geom_bar(stat = 'identity') +
+  theme_bw() + ylab('') + xlab('Normalised Enrichment Score (High vs Low PC2)')
+
+```
+
+
+That's weird...
+
+We finally get round to conducting differential expression analysis
+
+```{r Dysplastic BO vs NDBO: DGE}
+# Differential expression analysis
+dds.bo <- DESeq(dds.bo)
+res.bo <- results(dds.bo) %>% as.data.frame
+
+# Visualise results
+res.bo$logP <- -log10(res.bo$padj)
+
+res.bo$label <- 'NS'
+res.bo$label[res.bo$padj < .05] <- 'p-val'
+res.bo$label[abs(res.bo$log2FoldChange) > 1] <- 'log2fc'
+res.bo$label[res.bo$padj < .05 &
+                abs(res.bo$log2FoldChange) > 1] <- 'both'
+res.bo$label <- factor(res.bo$label, 
+                        levels = c('NS','p-val','log2fc','both'))
+
+res.bo$GeneID <- ensembldb::select(EnsDb.Hsapiens.v79,
+                                    keys = rownames(res.bo),
+                                    keytype = 'GENEID',
+                                    columns = 'SYMBOL')[,'SYMBOL']
+res.bo <- res.bo %>% arrange(padj)
+res.bo$GeneID[21:nrow(res.bo)] <- NA
+
+ggplot(res.bo, aes(x = log2FoldChange, y = logP, label = GeneID)) + 
+  theme_bw() +
+  geom_point(aes(col = label)) +
+  scale_color_manual(values = c('grey90','orange','yellow3','red')) +
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  geom_text_repel() +
+  labs(x = 'log2 Fold Change', y = '-log10(adjusted p-value)')
+ggsave(filename = 'Results/DGE_DysplasticBOvsNDBO.pdf', width = 6.5, height = 6)
+
+
+```
+Frustratingly, the analysis presented here is inconclusive, with only a small handful of genes indicating any differential expression. Additionally, the left-skewing (i.e. upregulation in NDBO) requires further analysis.
+
+```{r Dysplastic BO vs NDBO: functional analysis}
+# Order all genes by decreasing log2FoldChange
+original_gene_list <- res.bo$log2FoldChange
+names(original_gene_list) <- rownames(res.bo)
+gene_list <- sort(original_gene_list, decreasing = TRUE)
+
+# Gene ontology analysis
+gse.bo <- gseGO(geneList = gene_list,
+                 ont = 'BP',
+                 keyType = 'ENSEMBL',
+                 # nPerm = 10000,
+                 verbose = TRUE,
+                 OrgDb = 'org.Hs.eg.db',
+                 pAdjustMethod = 'fdr',
+                 pvalueCutoff = 1,
+                 by = 'fgsea')
+dotplot(gse.bo, showCategory = 10, split = '.sign') + facet_grid(.~.sign)
+ggsave(filename = 'Results/DGE_DysplasticBOvsNDBO_GeneOntology.pdf',
+       width = 7, height = 7)
+```
+
+## HOX and FAD genes
+
+As established, HOX gene upregulation is a central tenet in Barrett's development from normal gastric status. For the sake of completion, we can demonstrate how this pattern manifests. We can specifically check the HOXB genes which were highlighted in di Pietro et al. 2012.
+
+```{r HOX expression}
+
+# Isolate DGE results for HOXB genes
+hoxb.ensembl <- rowData(se)$GENEID[which(grepl(pattern = 'HOXB',rowData(se)$SYMBOL))]
+hoxb.ensembl <- hoxb.ensembl[hoxb.ensembl %in% rownames(res.bo)]
+res.hoxb <- res.bo[hoxb.ensembl, ]
+res.hoxb$GeneID <- rowData(se)$SYMBOL[match(hoxb.ensembl, rowData(se)$GENEID)]
+
+res.hoxb %>% arrange(padj)
+
+# Generate data fram for HOX gene expression and run Wilcoxon tests for Dysplasia vs NDBO
+df.hoxb <- data.frame(
+  Label = se$Label,
+  HOXB2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'HOXB2'),]+1),
+  HOXB6 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'HOXB6'),]+1),
+  HOXB8 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'HOXB8'),]+1),
+  HOXB5 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'HOXB5'),]+1),
+  HOXB7 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'HOXB7'),]+1)
+) %>%
+  pivot_longer(cols = -Label, names_to = 'Gene', values_to = 'log_TPM') %>%
+  mutate(Label = factor(Label, levels = c('NormalGastric','NDBO','DysplasticBO','NormalIntestine')))
+
+df.hoxb %>%
+  filter(Label %in% c('NDBO','DysplasticBO')) %>%
+  mutate(Label = factor(Label, levels = c('NDBO','DysplasticBO'))) %>%
+  group_by(Gene) %>%
+  wilcox_test(log_TPM ~ Label) %>%
+  adjust_pvalue(method = 'BH') %>% add_significance('p.adj') %>%
+  add_xy_position(x = 'Label') %>%
+  mutate(p.adj_label = sapply(round(p.adj,4), function(x) paste0('p.adj = ',x))) -> df.hoxb_byBO
+
+# Plot HOX gene expression (log2-TPM) across our groups (starting with those in the volcano plot)
+ggboxplot(df.hoxb[df.hoxb$Gene %in% c('HOXB2','HOXB6','HOXB8'),], 
+          x = 'Label', y = 'log_TPM', add = 'jitter', color = 'Label') +
+  facet_wrap(~Gene, scales = 'free') +
+  stat_pvalue_manual(df.hoxb_byBO[df.hoxb_byBO$Gene %in% c('HOXB2','HOXB6','HOXB8'),], 
+                     label = 'p.adj_label', xmin = 'group1', xmax = 'group2') +
+  labs(x = '', y = 'log2-TPM') + theme(legend.title = element_blank(),
+                                       axis.text.x = element_blank()) +
+  scale_color_manual(values = c('red2','green3','darkgreen','navy'))
+ggsave(filename = 'Results/Organoids_GastricBO_HOXexpression.pdf', height = 4)
+
+# ...and add the second two in SUpplementary data
+ggboxplot(df.hoxb[df.hoxb$Gene %in% c('HOXB5','HOXB7'),], 
+          x = 'Label', y = 'log_TPM', add = 'jitter', color = 'Label') +
+  facet_wrap(~Gene, scales = 'free') +
+  stat_pvalue_manual(df.hoxb_byBO[df.hoxb_byBO$Gene %in% c('HOXB5','HOXB7'),], 
+                     label = 'p.adj_label', xmin = 'group1', xmax = 'group2') +
+  labs(x = '', y = 'log2-TPM') + theme(legend.title = element_blank(),
+                                       axis.text.x = element_blank()) +
+  scale_color_manual(values = c('red2','green3','darkgreen','navy'))
+ggsave(filename = 'Results/Organoids_GastricBO_HOXexpression_suppFigure.pdf', height = 5)
+
+```
+However, the differential expression analysis on DysplasticBO vs NormalGastric also highlighted FADS2 as being significantly downregulated in dysplasia. FADS2 encodes the enzyme fatty acid desaturase enzyme, which is involved in lipid biosynthesis. Molendijk et al. (Clin and Trans Medicine, 2022) reported that FADS1/2 expression was elevated from Barrett's towards dysplasia and EAC, however this is in contrast to what is observed in our organoids. Additionally, they show that FADS2 inhibition, leading to a reduction in high polyunsaturated lipids, protected EAC cells from acid-induced DNA damage, potentially highlighted a benefit from downregulation of FADS2 (as we observe here).
+
+An additional factor worth mentioning is that in Molendijk et al., BO show increased FADS1/2 expression with respect to normal oesophagus as opposed to normal stomach. It stands to reason that the normal stomach may naturally display increased FADS1/2 expressionm, on account of its role in digestion. Intriguingly, FADS1 expression in the intestine is also high, and can be decreased following Roux-en-Y gasric bypass (Garla et al. Clin Nutr 2019)
+
+```{r FADS expression}
+# Plot FADS gene expression (log2-TPM) across our groups
+df.fads <- data.frame(
+  CaseID = se$CaseID,
+  Label = se$Label,
+  FADS1 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'FADS1'),]+1),
+  FADS2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'FADS2'),]+1)
+) %>%
+  pivot_longer(cols = c(FADS1, FADS2), names_to = 'Gene', values_to = 'log_TPM') %>%
+  mutate(Label = factor(Label, levels = c('NormalGastric','NDBO','DysplasticBO','NormalIntestine')))
+  
+ggboxplot(df.fads, x = 'Label', y = 'log_TPM', add = 'jitter', color = 'Label') +
+  facet_wrap(~Gene, scales = 'free') +
+  labs(x = '', y = 'log2-TPM') + theme(legend.title = element_blank(),
+                                       axis.text.x = element_blank()) +
+  scale_color_manual(values = c('red2','green3','darkgreen','navy'))
+ggsave(filename = 'Results/Organoids_GastricBO_FADSexpression.pdf', height = 4)
+
+```
+
+As we can see, normal stomach and intestine have elevated levels of FADS1/2 expression, which is depleted with progressive Barrett's oesophagus. FADS2 shows an intriguing bimodal distribution amongst NDBO organoids, although this appears unrelated to gastric or intestinal markers.
+
+```{r FADS2 in NDBO}
+# Compare FADS2 expression in NDBO to gastric and intestinal markers
+df.fads2_marks <- data.frame(
+  Label = se$Label,
+  FADS2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'FADS2'),]+1),
+  CDX2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'CDX2'),]+1),
+  MUC5AC = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC5AC'),]+1),
+  FADS1 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'FADS1'),]+1)
+) %>%
+  filter(Label == 'NDBO') %>%
+  pivot_longer(cols = c(FADS1, MUC5AC, CDX2), names_to = 'Gene', values_to = 'log_TPM')
+
+ggplot(df.fads2_marks, aes(x = FADS2, y = log_TPM)) +
+  theme_bw() +
+  geom_point() + geom_smooth(method = 'lm') +
+  facet_wrap(~Gene, scales = 'free') +
+  labs(x = 'log2(TPM) - FADS2', y = 'log2(TPM)')
+
+```
+We can also check goblet cell marker identification across groups
+
+```{r goblet cells}
+# Plot goblet cell  expression (log2-TPM) across our groups
+df.goblet <- data.frame(
+  CaseID = se$CaseID,
+  Label = se$Label,
+  TFF3 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'TFF3'),]+1),
+  # MUC5AC = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC5AC'),]+1),
+  # MUC5B = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC5B'),]+1),
+  MUC2 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'MUC2'),]+1),
+  REG4 = log2(assay(se,'counts.TPM')[which(rowData(se)$SYMBOL == 'REG4'),]+1)
+) %>%
+  pivot_longer(cols = c(TFF3, REG4, MUC2), names_to = 'Gene', values_to = 'log_TPM') %>%
+  mutate(Label = factor(Label, levels = c('NormalGastric','NDBO','DysplasticBO','NormalIntestine')))
+  
+ggboxplot(df.goblet, x = 'Label', y = 'log_TPM', add = 'jitter', color = 'Label') +
+  facet_wrap(~Gene, scales = 'free') +
+  labs(x = '', y = 'log2-TPM') + theme(legend.title = element_blank(),
+                                       axis.text.x = element_blank()) +
+  scale_color_manual(values = c('red2','green3','darkgreen','navy'))
+```
+
+
+# Functional and Pathway Enrichment Analysis
+
+In addition to our differential expression analysis, we can also consider our comparisons of dysplastic/NDBO vs normal gastric organoids simultaneously. As suggested by HOX upregulation and similar gene ontology analysis results, it is likely that, whilst these organoids will likely display differences given their dysplasia statuses, there will be broad similarities in differential expression. We can start by checking this.
+
+## Comparison of DGE analyses
+
+```{r concordance in differential expression}
+# Overlap in DGEs (+ deviations in pathway enrichment?)
+res.ndbe$EnsID <- rownames(res.ndbe); res.ndbe$Test <- 'NDBO vs Gastric'
+res.dys$EnsID <- rownames(res.dys); res.dys$Test <- 'Dysplastic vs Gastric'
+
+# Combine results of differential expression analysis, and show volumes of shared/different DEGs
+res2 <- rbind(res.ndbe, res.dys)
+res2 %>%
+  dplyr::filter(label == 'both') %>%
+  group_by(EnsID) %>% summarise(Tests = list(Test)) %>%
+  ggplot(aes(x = Tests)) + theme_bw() +
+  geom_bar(fill = 'steelblue') +
+  scale_x_upset() + labs(x = '', y = '# DEGs')
+
+# Consider l2fc and padj comparisons
+res2.plot_l2fc <- res2[,c('EnsID','log2FoldChange','Test')] %>%
+  pivot_wider(names_from = 'Test', values_from = 'log2FoldChange')
+res2.plot_padj <- res2[,c('EnsID','padj','Test')] %>%
+  pivot_wider(names_from = 'Test', values_from = 'padj')
+names(res2.plot_padj)[-1] <- c('padj_NDBO','padj_Dysplastic')
+
+res2.plot <- merge(x = res2.plot_l2fc, y = res2.plot_padj)
+res2.plot$group <- 'NS'
+res2.plot$group[abs(res2.plot$`NDBO vs Gastric`) > 1 &
+                  res2.plot$padj_NDBO < .05] <- 'NDBO only'
+res2.plot$group[abs(res2.plot$`Dysplastic vs Gastric`) > 1 &
+                  res2.plot$padj_Dysplastic < .05] <- 'Dysplastic only'
+res2.plot$group[abs(res2.plot$`NDBO vs Gastric`) > 1 &
+                  res2.plot$padj_NDBO < .05 &
+                  abs(res2.plot$`Dysplastic vs Gastric`) > 1 &
+                  res2.plot$padj_Dysplastic < .05] <- 'NDBO and Dysplastic'
+
+# Plotting comparisons of log2(fold change), coloured by significance
+ggplot(res2.plot, aes(x = `NDBO vs Gastric`, y = `Dysplastic vs Gastric`, color = group)) +
+  theme_bw() + geom_point() + 
+  theme(legend.position = 'top', legend.title = element_blank()) +
+  scale_color_manual(values = c('darkgreen','red','green3','gray90')) +
+  geom_hline(col = 'red', linetype = 'dashed', yintercept = -1) +
+  geom_hline(col = 'red', linetype = 'dashed', yintercept = 1) +
+  geom_vline(col = 'red', linetype = 'dashed', xintercept = -1) +
+  geom_vline(col = 'red', linetype = 'dashed', xintercept = 1) +
+  labs(x = 'log2 Fold Change (NDBO vs Gastric)',
+       y = 'log2 Fold Change (Dysplastic BO vs Gastric)')
+ggsave(filename = 'Results/DGE_log2fcConcordance.pdf', width = 6.5, height = 4.5)
+
+```
+
+We observe overwhelming concordance in differential expression analysis results, as would be expected given the sources of the organoids. But we can already see a few genes deviating, labelled in green.
+
+## Functional enrichment analysis
+
+What we can do here is conduct functional enrichment analysis, where we take a gene list and determine pathway enrichment. Therefore, we can see which pathway alterations are shared (i.e. amongst shared DEGs) and those which are unique (i.e. amongst unique DEGs). Functional enrichment analysis can be done using the gprofiler2 R package.
+
+```{r functional enrichment analysis: shared DEGs}
+# # Collate all DEGs and group by significant tests
+# res2.degs <- res2 %>%
+#   dplyr::filter(label == 'both') %>%
+#   group_by(EnsID) %>% summarise(Tests = list(Test))
+# 
+# # Extract shared DEGs and conduct functional enrichment analysis
+# deg.shared <- res2.degs$EnsID[sapply(res2.degs$Tests, function(x) length(x)==2)]
+# gostres.shared <- gost(query = deg.shared, organism = 'hsapiens',
+#                        ordered_query = FALSE, correction_method = 'fdr')
+# g_shared <- gostplot(gostres.shared, interactive = FALSE) + ggtitle('Gene list enrichment: DEGs (NDBO and Dysplastic)')
+# ggsave(g_shared, filename = 'Results/FunctionalEnrichment_DysplasticAndNDBO.pdf')
+# 
+# # Display top altered pathways
+# gostres.shared$result %>% arrange(p_value) %>% head(10)
+# gostres.shared_result <- gostres.shared$result
+# 
+# # save(gostres.shared_result, file = 'Results/DEG_FunctionalEnrichment_NDBOandDysplastic.Rdata')
+# gostres.shared_result$parents <- gostres.shared_result$parents %>% as.character
+# write.csv(gostres.shared_result, file = 'Results/DEG_FunctionalEnrichment_NDBOandDysplastic.csv', row.names = FALSE)
+
+```
+
+Let's re-run this, but separate shared up- and down-regulated genes.
+
+```{r functional enrichment analysis: shared DEGs up and down-regulated}
+# Collate all shared DEGs and separate into up- and down-regulated genes
+res2.pivot <- res2 %>% 
+  dplyr::filter(label == 'both') %>% 
+  dplyr::select(EnsID, Test, log2FoldChange) %>% 
+  pivot_wider(names_from = 'Test', values_from = 'log2FoldChange')
+
+# Find up- and down-regulated genes
+res2.pivot$Reg <- NA
+res2.pivot$Reg[res2.pivot$`NDBO vs Gastric` > 0 & res2.pivot$`Dysplastic vs Gastric` > 0] <- 'Up'
+res2.pivot$Reg[res2.pivot$`NDBO vs Gastric` < 0 & res2.pivot$`Dysplastic vs Gastric` < 0] <- 'Down'
+
+genes.up <- res2.pivot$EnsID[res2.pivot$Reg == 'Up']
+genes.down <- res2.pivot$EnsID[res2.pivot$Reg == 'Down']
+
+# Run gProfiler
+multi_gp <- gost(list('up-regulated' = genes.up, 'down-regulated' = genes.down), organism = 'hsapiens',
+                       ordered_query = FALSE, correction_method = 'fdr')
+g_shared <- gostplot(multi_gp, interactive = FALSE)
+ggsave(g_shared, filename = 'Results/FunctionalEnrichment_DysplasticAndNDBO.pdf', width = 10)
+
+# Save results
+gostres.shared_result <- multi_gp$result
+gostres.shared_result$parents <- gostres.shared_result$parents %>% as.character
+write.csv(gostres.shared_result, file = 'Results/DEG_FunctionalEnrichment_NDBOandDysplastic.csv', row.names = FALSE)
+```
+
+
+
+As expected, amongst shared DEGs, highlighted pathways focus on developmental and morphogenic processes, as well as goblet cells markers as indicated in the HPA section.
+
+However, how might this differ when consideing only those enriched in NDBO organoids?
+
+```{r functional enrichment analysis: NDBO genes}
+# # Extract genes only differentially expressed in NDBO
+# deg.ndbe <- res2.degs$EnsID[res2.degs$Tests == 'NDBO vs Gastric']
+# gostres.ndbe <- gost(query = deg.ndbe, organism = 'hsapiens',
+#                      ordered_query = FALSE, correction_method = 'fdr')
+# g_ndbe <- gostplot(gostres.ndbe, interactive = FALSE) + ggtitle('Gene list enrichment: DEGs (NDBO only)')
+# ggsave(g_ndbe, filename = 'Results/FunctionalEnrichment_NDBOonly.pdf',
+#        height = 4.5, width = 7)
+# 
+# # Highlight top altered pathways
+# gostres.ndbe$result %>% arrange(p_value) %>% head(10)
+# 
+# gostres.ndbe_result <- gostres.ndbe$result
+# gostres.ndbe_result$parents <- gostres.ndbe_result$parents %>% as.character
+# # save(gostres.ndbe_result, file = 'Results/DEG_FunctionalEnrichment_NDBOonly.Rdata')
+# write.csv(gostres.ndbe_result, file = 'Results/DEG_FunctionalEnrichment_NDBOonly.csv', row.names = FALSE)
+# 
+# # Highlight top hits amongst Human Phenotype Atlas (HPA) databases
+# gostres.ndbe$result %>% dplyr::filter(source == 'HPA') %>%
+#   arrange(p_value) %>% head(20)
+
+
+
+```
+
+Separate into up- and down-regulated genes for NDBO-only DEGS
+```{r functional enrichment analysis: NDBO DEGs up and down-regulated}
+# Collate all shared DEGs and separate into up- and down-regulated genes
+deg.ndbe <- res2$EnsID[res2$label == 'both' & res2$Test == 'NDBO vs Gastric']
+deg.dys <- res2$EnsID[res2$label == 'both' & res2$Test == 'Dysplastic vs Gastric']
+
+deg.ndbe_only <- deg.ndbe[!(deg.ndbe %in% deg.dys)]
+
+# Get up- and down-regulated genes differentially expressed in NDBO only
+res2.ndbe_only <- res2 %>% dplyr::filter(Test == 'NDBO vs Gastric' & EnsID %in% deg.ndbe_only)
+genes.up_ndbe_only <- res2.ndbe_only$EnsID[res2.ndbe_only$log2FoldChange > 0]
+genes.down_ndbe_only <- res2.ndbe_only$EnsID[res2.ndbe_only$log2FoldChange < 0]
+
+# Run gProfiler
+multi_gp_ndbe_only <- gost(list('up-regulated' = genes.up_ndbe_only, 'down-regulated' = genes.down_ndbe_only), organism = 'hsapiens',
+                       ordered_query = FALSE, correction_method = 'fdr')
+g_ndbe_only <- gostplot(multi_gp_ndbe_only, interactive = FALSE)
+ggsave(g_ndbe_only, filename = 'Results/FunctionalEnrichment_NDBOonly.pdf', width = 9)
+
+# Save results
+gostres.ndbe_only_result <- multi_gp_ndbe_only$result
+gostres.ndbe_only_result$parents <- gostres.ndbe_only_result$parents %>% as.character
+write.csv(gostres.ndbe_only_result, file = 'Results/DEG_FunctionalEnrichment_NDBOonly.csv', row.names = FALSE)
+```
+
+Finally, we can check genes enriched only in dysplastic organoids
+
+```{r functional enrichment analysis: dysplastic BO genes}
+# # Extract genes only differentially expressed in NDBO
+# deg.dys <- res2.degs$EnsID[res2.degs$Tests == 'Dysplastic vs Gastric']
+# gostres.dys <- gost(query = deg.dys, organism = 'hsapiens',
+#                     ordered_query = FALSE, correction_method = 'fdr')
+# g_dys <- gostplot(gostres.dys, interactive = FALSE) + ggtitle('Gene list enrichment: DEGs (Dysplastic only)')
+# ggsave(g_dys, filename = 'Results/FunctionalEnrichment_Dysplasticonly.pdf',
+#        height = 4.5, width = 7)
+# 
+# # Show top hits
+# gostres.dys$result %>% arrange(p_value) %>% head(10)
+# 
+# gostres.dys_result <- gostres.dys$result
+# gostres.dys_result$parents <- gostres.dys_result$parents %>% as.character
+# # save(gostres.dys_result, file = 'Results/DEG_FunctionalEnrichment_Dysplasticonly.Rdata')
+# write.csv(gostres.dys_result, file = 'Results/DEG_FunctionalEnrichment_Dysplasticonly.csv', row.names = FALSE)
+# 
+# gostres.dys_result %>% dplyr::filter(source == 'CORUM') %>%
+#   arrange(p_value) %>% head(20)
+
+```
+
+Separate into up- and down-regulated genes for Dysplastic-only DEGS
+```{r functional enrichment analysis: dysplastic DEGs up and down-regulated}
+deg.dys_only <- deg.dys[!(deg.dys %in% deg.ndbe)]
+
+# Get up- and down-regulated genes differentially expressed in Dysplastic only
+res2.dys_only <- res2 %>% dplyr::filter(Test == 'Dysplastic vs Gastric' & EnsID %in% deg.dys_only)
+genes.up_dys_only <- res2.dys_only$EnsID[res2.dys_only$log2FoldChange > 0]
+genes.down_dys_only <- res2.dys_only$EnsID[res2.dys_only$log2FoldChange < 0]
+
+# Run gProfiler
+multi_gp_dys_only <- gost(list('up-regulated' = genes.up_dys_only, 'down-regulated' = genes.down_dys_only), organism = 'hsapiens',
+                       ordered_query = FALSE, correction_method = 'fdr')
+g_dys_only <- gostplot(multi_gp_dys_only, interactive = FALSE)
+ggsave(g_dys_only, filename = 'Results/FunctionalEnrichment_Dysplasticonly.pdf', width = 9)
+
+# Save results
+gostres.dys_only_result <- multi_gp_dys_only$result
+gostres.dys_only_result$parents <- gostres.dys_only_result$parents %>% as.character
+write.csv(gostres.dys_only_result, file = 'Results/DEG_FunctionalEnrichment_Dysplasticonly.csv', row.names = FALSE)
+```
+
+Intriguingly, top hits amongst dysplastic DEGs were focussed on the database of transcription factor binding sites, specifically in terms of down-regulated genes. This is a huge alteration compared to other sources as well.
+
+```{r source alterations}
+# #  Save full set of plots
+# g_merged <- g_shared/(g_ndbe + g_dys)
+# ggsave(g_merged, file = 'Results/FunctionalEnrichment_fullPlot.pdf', width = 12)
+# 
+# # Note the increase in TF-linked pathway alteration in dysplastic state
+# df.gost_sources <- data.frame(
+#   DEG = factor(
+#     c(rep('Shared',nrow(gostres.shared$result)),
+#       rep('NDBO only',nrow(gostres.ndbe$result)),
+#       rep('Dysplastic only',nrow(gostres.dys$result))),
+#     levels = c('Shared','NDBO only', 'Dysplastic only')),
+#   Source = factor(c(gostres.shared$result$source,
+#              gostres.ndbe$result$source,
+#              gostres.dys$result$source),
+#              levels = c('GO:MF','GO:CC','GO:BP','KEGG','REAC',
+#                         'TF','MIRNA','HPA','CORUM','HP','WP'))
+# ) %>%
+#   group_by(DEG, Source) %>% summarise(n_DEG = n())
+# 
+# ggplot(df.gost_sources, aes(x = DEG, y = n_DEG, fill = DEG)) +
+#   theme_bw() + geom_bar(stat = 'identity', color = 'white') +
+#   theme(axis.text.x = element_blank(),
+#         legend.position = 'top',
+#         legend.title = element_blank()) +
+#   labs(x = '', y = 'Number of Enriched Features') +
+#   facet_wrap(~Source, nrow=1)
+
+```
+
