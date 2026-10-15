@@ -37,18 +37,23 @@ meta.seq$sequence_id <- sapply(meta.seq$sequence_id, function(x) str_replace(x,p
 index.1672_include <- which(meta.seq$sequence_id %in% c('WTSI-OESO_198_1pre','WTSI-OESO_211_1pre','WTSI-OESO_224_1pre'))
 meta.seq$sequence_id[index.1672_include] <- paste0('1672_',meta.seq$sequence_id[index.1672_include])
 
-# Add clinical information, and merge this with metadata
-meta.clin <- read_excel('Data/query_standard_cohort_2025-03-25_16-27-46.xlsx') %>%
-  dplyr::filter(!duplicated(`OCCAMS ID`)) %>%
-  dplyr::select(`OCCAMS ID`,`PS TStage Primary Tumour Final Pretreatment Staging`,
-                `RP Tumour Grading Differentiation Status`,`TRNC Chemotherapy Treatment Protocol`)
-names(meta.clin) <- c('case_id','Stage','DifferentiationStatus','ChemoTreatment')
+# # Add clinical information, and merge this with metadata
+# meta.clin <- read_excel('Data/query_standard_cohort_2025-03-25_16-27-46.xlsx') %>%
+#   dplyr::filter(!duplicated(`OCCAMS ID`)) %>%
+#   dplyr::filter(`OCCAMS ID` != 'OCCAMS/AH/467') %>% # no WGS for this patient - likely blood mismatch
+#   dplyr::select(`OCCAMS ID`,`PS TStage Primary Tumour Final Pretreatment Staging`,
+#                 `RP Tumour Grading Differentiation Status`,`TRNC Chemotherapy Treatment Protocol`)
+# names(meta.clin) <- c('case_id','Stage','DifferentiationStatus','ChemoTreatment')
+meta.clin <- read_excel('Data/Copy of Org_Clinical_demo_For_DJ.xlsx') %>%
+  dplyr::filter(!is.na(Age)) %>%
+  dplyr::filter(ID != 'OCCAMS/AH/467') %>%
+  mutate(Stage = sapply(`Surgical TNM`, function(x) strsplit(x,split='N')[[1]][1]))
 
-# Fix staging nomenclature
-meta.clin$Stage[meta.clin$Stage == 'tumour_invades_adventitia'] <- 'T3'
-meta.clin$Stage[meta.clin$Stage == 'tumour_invades_muscularis_propria'] <- 'T2'
+# # Fix staging nomenclature
+# meta.clin$Stage[meta.clin$Stage == 'tumour_invades_adventitia'] <- 'T3'
+# meta.clin$Stage[meta.clin$Stage == 'tumour_invades_muscularis_propria'] <- 'T2'
 
-meta <- merge(x = meta.seq, y = meta.clin)
+meta <- merge(x = meta.seq, y = meta.clin, by.x = 'case_id', by.y = 'ID')
 
 ```
 
@@ -88,7 +93,7 @@ rownames(counts.TPM) <- rownames(file.counts)
 
 # Generate col_data and row_data, for eventual collation into a SummatizedExperiment object
 col_data <- meta %>% dplyr::select('sequence_id','case_id','passage','sequencing_batch',
-                                   'Stage','DifferentiationStatus','ChemoTreatment') %>% 
+                                   'Stage','Histopathological grading','Chemotherapy regimen') %>% 
   as.data.frame
 rownames(col_data) <- col_data$sequence_id
 
@@ -148,19 +153,23 @@ pca.vsd_combat <- prcomp(t(assay(vsd_combat.pca_plot)), center = TRUE)
 print(summary(pca.vsd_combat))
 df.pca <- data.frame(
   PC1 = pca.vsd_combat$x[,'PC1'], PC2 = pca.vsd_combat$x[,'PC2'],
-  Stage = vsd_combat.pca_plot$Stage, Batch = vsd_combat.pca_plot$sequencing_batch
+  Stage = vsd_combat.pca_plot$Stage, Batch = vsd_combat.pca_plot$sequencing_batch,
+  Chemotherapy = vsd_combat.pca_plot$`Chemotherapy regimen`
 )
 
 # Check sequencing batch
 ggplot(df.pca, aes(x = PC1, y = PC2, color = Batch)) + theme_bw() + geom_point()
 
+df.pca$Stage[df.pca$Stage %in% c('T1a','T1b')] <- 'T1'
+df.pca$Stage[df.pca$Stage %in% c('T4a','T4b')] <- 'T4' 
+
 # Check Stage
-pdf('Results/OrganoidsOAC_RNAseq_PCAbyStage.pdf', width=5, height=5)
-ggplot(df.pca, aes(x = PC1, y = PC2, color = Stage)) + theme_bw() +
-  geom_point() +
-  labs(x = 'PC1: 12.5% variance', y = 'PC2: 12.0% variance') +
+pdf('Results/OrganoidsOAC_RNAseq_PCAbyStage.pdf', width=7, height=7)
+ggplot(df.pca, aes(x = PC1, y = PC2, color = Stage, shape = Chemotherapy)) + theme_bw() +
+  geom_point(size = 2.5) +
+  labs(x = 'PC1: 12.8% variance', y = 'PC2: 11.6% variance') +
   theme(legend.position = 'top', legend.title = element_blank()) +
-  scale_color_manual(values = c('yellow2','gold','orange','orangered'))
+  scale_color_manual(values = c('gray70','yellow2','gold','orange','orangered'))
 dev.off()
 
 ```
@@ -222,7 +231,7 @@ set.seed(123)
 res.fgsea <- fgsea(pathways = Hs.H, stats = ranks)
 
 df_res.fgsea <- res.fgsea %>% as.data.frame() %>%
-  dplyr::filter(padj < 0.2) %>% arrange(NES) %>%
+  dplyr::filter(padj < 0.1) %>% arrange(NES) %>%
   mutate(pathway = factor(pathway, levels = pathway))
 ggplot(df_res.fgsea, aes(x = NES, y = pathway, fill = padj)) + theme_bw() +
   geom_bar(stat = 'identity') +
@@ -252,5 +261,9 @@ se.tpm_col$CCNE1_TPM = assay(se.tpm)[which(rowData(se.tpm)$SYMBOL == 'CCNE1'),]
 se.tpm_col$CCNE1_vsd_combat = assay(vsd_combat)[which(rowData(vsd_combat)$SYMBOL == 'CCNE1'), se.tpm_col$sequence_id]
 
 write.csv(se.tpm_col, file = 'Results/OrganoidsOAC_treatedCDK46i_Markers.csv')
+```
+
+```{r session-info}
+sessionInfo()
 ```
 

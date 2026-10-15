@@ -1,0 +1,422 @@
+---
+title: "Single-Cell RNA-seq Analysis of normal gastric/BO/dysplasia organoids"
+author: "Daniel Jacobson"
+date: "2026-08-05"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+In this script, we will conduct analysis of single-cell RNA-seq of 24 organoids derived from six organoid lines. These lines include 2 normal gastric (one from gastric body, the other from GOJ), 2 Barrett oesophagus, and 2 derived from dysplasia. For each line, two different organoid culturing media were used (OWR and INC), and each had two replicates, resulting in 24 organoids total.
+
+These organoids then underwent single-cell RNA-sequencing wiht on-chip multiplexing, and were processed using CellRanger adapted for OCM data.
+
+The aims of this analysis are:
+
+* To determine the cell types present in these organoids
+* To demonstrate concordance between organoids of the same origins
+* To show equivalence in cell populations depending on culture media
+
+
+```{r load-libraries, message=FALSE}
+library(tidyverse) # data frame manipulation
+library(Seurat) # single cell analysis
+library(ggpubr) # plotting
+library(ggridges) # ridgeplots
+library(harmony) # batch correction for single cell data
+```
+
+# Data Processing
+
+## Loading and processing
+
+To begin with, we can load in the data and match it with our sample metadata and addition information.
+
+```{r download-data}
+# Download the data here
+se.filtered <- readRDS('Data/Data_run20260615_IlluminaSampleConvention/combined_filtered_matrix.seurat.rds')
+
+# Match with sample IDs (from submission metadata) so that we can begin comparisons
+yibing <- readxl::read_excel('../ScRNA-seq OCM submission sheet_Yibing.xlsx', skip=1) %>%
+  dplyr::filter(tpye == 'organoid') # spelling mistake occurs within the metadata sheet
+
+# Generate sample ID (combination of patient ID, origin, media, and number)
+yibing$Sample.ID.full <- apply(yibing, 1, function(x) paste(x[c('Patient ID','Origin','treatement')], collapse='_')) 
+
+# Add sequencing metadata and merge
+slx_contents <- read.csv('SLX-26391.23MVFCLT4.s_1.contents.csv') %>%
+  mutate(OB1 = sapply(Sample.name, function(x) as.numeric(strsplit(strsplit(x, split=' ')[[1]][2], split='-')[[1]][1])),
+         OB2 = sapply(Sample.name, function(x) as.numeric(strsplit(strsplit(x, split=' ')[[1]][2], split='-')[[1]][1])) + 1,
+         OB3 = sapply(Sample.name, function(x) as.numeric(strsplit(strsplit(x, split=' ')[[1]][2], split='-')[[1]][1])) + 2,
+         OB4 = sapply(Sample.name, function(x) as.numeric(strsplit(strsplit(x, split=' ')[[1]][2], split='-')[[1]][1])) + 3) %>%
+  pivot_longer(cols = c(OB1, OB2, OB3, OB4), names_to = 'OB_value', values_to = 'Sample.ID')
+slx_contents$Sequence.ID = apply(slx_contents, 1, function(x) paste(x[c('Pool','Barcode','OB_value')], collapse='_'))
+
+yibing_slx <- merge(x = slx_contents, y = yibing, by.x = 'Sample.ID', by.y = 'Sample ID')
+
+```
+
+Let us now add the relevant information to the colData for se.filtered
+
+```{r add-cell-info}
+# Extract cell IDs
+se.filtered$Cell.ID = sapply(names(se.filtered$sample), function(x) str_replace(x,'_filtered',''))
+se.filtered$Sequence.ID = sapply(se.filtered$sample, function(x) str_replace(x,'_filtered',''))
+
+# Patient information matched with Yibing's metadata
+se.filtered$Patient.ID = yibing_slx$`Patient ID`[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+se.filtered$Origin = yibing_slx$Origin[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+se.filtered$Origin[se.filtered$Origin == 'BE'] <- 'NDBO'
+se.filtered$Treatment = yibing_slx$treatement[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+se.filtered$Treatment <- sapply(se.filtered$Treatment, function(x) strsplit(x,split='_')[[1]][1]) # removes the number
+
+# Sample info
+se.filtered$expected_cell_number = yibing_slx$`cell number`[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+se.filtered$viability = yibing_slx$viability[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+se.filtered$Sample.ID.full = yibing_slx$Sample.ID.full[match(se.filtered$Sequence.ID, yibing_slx$Sequence.ID)]
+
+```
+
+Annoyingly, we also need to convert row names from EnsemblID to gene symbols, especially for checking mitochondrial fraction
+
+```{r fix-gene-names}
+# Load Ensembl database
+# ensembl_113 <- biomaRt::useEnsembl(
+#   host = "https://jun2026.archive.ensembl.org",
+#   biomart = 'genes',
+#   dataset = 'hsapiens_gene_ensembl',
+#   version = 113,
+#   mirror = 'asia'
+# )
+# 
+# ensembl_113 <- biomaRt::useMart(
+#   biomart = "ENSEMBL_MART_ENSEMBL",
+#   dataset = "hsapiens_gene_ensembl",
+#   host    = "https://jun2026.archive.ensembl.org"
+# )
+# 
+# # Get gene symbols matched to se.filtered
+# gene_symbols.113 <- ensembldb::select(
+#   ensembl_113,
+#   keys = rownames(se.filtered),
+#   keytype = 'ensembl_gene_id',
+#   columns = c('ensembl_gene_id','hgnc_symbol')
+# ) %>% dplyr::filter(!duplicated(ensembl_gene_id) & !duplicated(hgnc_symbol) & hgnc_symbol != '')
+
+library(AnnotationHub)
+ah <- AnnotationHub()
+edb <- ah[["AH119325"]]                  # Ensembl 113 EnsDb for Homo sapiens
+
+gene_symbols.113 <- ensembldb::select(
+  edb,
+  keys = rownames(se.filtered),
+  keytype = "GENEID",
+  columns = c("GENEID", "SYMBOL")
+) %>% dplyr::filter(!duplicated(GENEID) & !duplicated(SYMBOL) & SYMBOL != '')
+
+# Combine with se.filtered and replace gene names
+se.filtered <- se.filtered[gene_symbols.113$GENEID, ]
+gene_symbols.113 <- gene_symbols.113[match(rownames(se.filtered), gene_symbols.113$GENEID), ]
+rownames(se.filtered) <- gene_symbols.113$SYMBOL
+
+# save(se.filtered, file = 'Data/combined_filtered_matrix_geneFix.Rdata')
+
+```
+
+
+# Feature Checks and Quality Control
+
+Moving forward with our processed data, check feature counts and mitochondrial content
+
+```{r check-feature-counts}
+# Get read and feature count information
+df.filtered_features <- data.frame(
+  orig.ident = se.filtered$Cell.ID,
+  Sample.ID.full = factor(se.filtered$Sample.ID.full),
+  origin = se.filtered$Origin,
+  nCount = se.filtered$nCount_RNA, nFeature = se.filtered$nFeature_RNA
+) %>%
+  mutate(origin = sapply(origin, function(x) ifelse(x %in% c('NG','GOJ'), 'NG/GOJ', x))) %>%
+  mutate(origin = factor(origin, levels = c('NG/GOJ','NDBO','dysplasia'))) %>%
+  pivot_longer(cols = c(nCount, nFeature), names_to = 'Feature')
+
+# Get organoid 'order', purely for plotting purposes
+order_pdo <- df.filtered_features %>%
+  group_by(Sample.ID.full, origin) %>% summarise() %>%
+  arrange(origin, Sample.ID.full)
+df.filtered_features$Sample.ID.full <- factor(df.filtered_features$Sample.ID.full, levels = order_pdo$Sample.ID.full)
+
+ggviolin(df.filtered_features, x = 'Sample.ID.full', y = 'value', fill = 'origin') + 
+  theme(legend.position = 'top', axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + labs(x = '', y = '') +
+  facet_wrap(~Feature, ncol=3, scales = 'free')
+
+```
+
+We can infer from this that each organoid possesses a fair chunk of low-feature cells (likely ambient RNA), and whilst this appears slightly enriched in gastric organoids, it is not specific. Additionally, feature counts are expected to be relatively high for OCM-processed data.
+
+We should also check mitochondrial content.
+
+```{r check-mitochondrial-fraction}
+# Calculate mitochondrial fraction
+se.filtered$percent.mt <- PercentageFeatureSet(se.filtered, pattern = "^MT-")
+
+df.filtered_mito <- data.frame(
+  orig.ident = se.filtered$Cell.ID,
+  Sample.ID.full = factor(se.filtered$Sample.ID.full),
+  origin = se.filtered$Origin,
+  mito_fraction = se.filtered$percent.mt
+) %>%
+  mutate(origin = sapply(origin, function(x) ifelse(x %in% c('NG','GOJ'), 'NG/GOJ',x))) %>%
+  mutate(origin = factor(origin, levels = c('NG/GOJ','NDBO','dysplasia')),
+         Sample.ID.full = factor(Sample.ID.full, levels = order_pdo$Sample.ID.full[24:1]))
+
+ggplot(df.filtered_mito, aes(x = mito_fraction, y = Sample.ID.full, fill = origin)) +
+  geom_density_ridges(alpha = .6) + theme_ridges() +
+  labs(x = 'Mitochondrial Fraction (%)', y = '')
+
+```
+
+These organoids look good with respect to mitochondrial fraction. So, we will filter the cohort to include cells with minimum feature counts of 1500 and maximum mitochondrial fraction of 25%.
+
+```{r QC-filtering-and-cell-counts}
+# Filter data
+se.filtered <- subset(se.filtered, subset = nFeature_RNA > 1500 & percent.mt < 25)
+
+print(paste0('Total cells included: ',ncol(se.filtered)))
+
+# Check cell count distributions by organoid
+df.cell_counts <- data.frame(table(se.filtered$Sample.ID.full)); names(df.cell_counts) <- c('Sample.ID.full','cell_count')
+df.cell_counts$Sample.ID.full <- factor(df.cell_counts$Sample.ID.full, levels = order_pdo$Sample.ID.full)
+
+# Fix order of samples
+df.cell_counts$PatientID <- sapply(as.character(df.cell_counts$Sample.ID.full), function(x) strsplit(x,split='_')[[1]][1])
+df.cell_counts$PatientID <- factor(df.cell_counts$PatientID,
+                                   levels = c('DE04','DE27','AHM1977','AHM1678','AHM2221','AHM2165'))
+df.cell_counts <- df.cell_counts %>% arrange(PatientID)
+df.cell_counts$Sample.ID.full <- factor(df.cell_counts$Sample.ID.full,
+                                        levels = df.cell_counts$Sample.ID.full)
+
+df.cell_counts$Origin <- sapply(as.character(df.cell_counts$Sample.ID.full), function(x) strsplit(x,split='_')[[1]][2])
+df.cell_counts$Origin[df.cell_counts$Origin == 'BE'] <- 'NDBO'
+df.cell_counts$Origin <- sapply(df.cell_counts$Origin, function(x) ifelse(x %in% c('NG','GOJ'), 'NG/GOJ',x))
+df.cell_counts$Origin <- factor(df.cell_counts$Origin, levels = c('NG/GOJ','NDBO','dysplasia'))
+
+ggplot(df.cell_counts, aes(x = Sample.ID.full, y = cell_count, fill = Origin)) + theme_bw() +
+  geom_bar(stat = 'identity') + facet_wrap(~Origin, scales = 'free_x', nrow=1, space = 'free_x') + 
+  theme(legend.position = 'top',axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = '', y = 'Final Cell Count')
+```
+
+Whilst these cell counts are lower than expected, they are generally in line with expected counts given viabilities.
+
+
+
+# Clustering and Cell Type Annotation
+
+## Clustering and normalisation
+
+To begin we can do data normalisation and scaling, before running Harmony to correct for similar cell populations present across patient IDs/match with chips.
+
+```{r normalisation-and-clustering}
+# Normalisation, feature selection, and scaling
+se.filtered <- NormalizeData(se.filtered) # log-normalisation
+se.filtered <- FindVariableFeatures(se.filtered, selection.method = "vst", nfeatures = 2000)
+se.filtered <- ScaleData(se.filtered)
+
+# Perform linear deminsionality reduction
+se.filtered <- RunPCA(se.filtered, features = VariableFeatures(object = se.filtered))
+
+# Run harmony and run dimensional reduction
+se.harmony <- se.filtered
+se.harmony <- RunHarmony(se.harmony, 'Patient.ID')
+se.harmony <- RunUMAP(se.harmony, reduction = 'harmony', dims=1:15)
+
+# Find Neighbours and clusters
+ElbowPlot(se.harmony, reduction = 'harmony') # 12 clusters looks optimal
+se.harmony <- FindNeighbors(se.harmony, dims = 1:15, reduction = 'harmony')
+se.harmony <- FindClusters(se.harmony, resolution = .48, reduction = 'harmony')
+
+se.harmony$Patient.ID <- factor(se.harmony$Patient.ID,
+                                levels = c('DE04','DE27','AHM1678','AHM1977','AHM2165','AHM2221'))
+DimPlot(se.harmony, reduction = 'umap', group.by = 'Patient.ID') + 
+  ggtitle('UMAP of organoids: batch correction using Harmony') +
+  scale_color_manual(values = c('royalblue','lightblue','green4','palegreen','red3','pink2'))
+
+```
+
+We should also check representation of cell types clusters across patients.
+
+```{r compare-patients-clusters}
+clusters_vs_patients <- data.frame(
+  Cluster = se.harmony$seurat_clusters,
+  Patient = se.harmony$Patient.ID,
+  Sample = se.harmony$Sample.ID.full,
+  Treatment = sapply(se.harmony$Treatment, function(x) strsplit(x,split='_')[[1]][1])
+) %>%
+  group_by(Patient, Cluster, Treatment) %>% summarise(n=n())
+
+ggplot(clusters_vs_patients, aes(x = Cluster, y = n, fill = Patient)) + theme_bw() +
+  geom_bar(stat = 'identity') + theme(legend.position = 'top') +
+  coord_flip() +
+  scale_fill_manual(values = c('royalblue','lightblue','green4','palegreen','red3','pink2')) +
+  facet_wrap(~Treatment)
+```
+
+## Defining cell types
+
+The rigorous part of the cell type definitions has been conducted off-Rmarkdown, so the purposes here are simply to demonstrate alignment between our labels and the relevant markers.
+
+```{r define-clusters}
+cluster.ids = c('Metaplastic Progenitor','Metaplastic Intestinal','Gastric Neck','Cycling 1','Metaplastic Cycling','Cycling 2','Gastric Cycling','Gastric Progenitor','Gastric Foveolar','Metaplastic TGFb','Ciliated','Metaplastic Plastic')
+
+# cluster.ids = c('Metaplastic Intestinal','Gastric Neck','Metaplastic Progenitor','Cycling 1', 'Metaplastic Cycling','Cycling 2',
+#                 'Gastric Progenitor','Metaplastic TGFb','Ciliated','Metaplastic Plastic','Gastric Intermediate','Gastric Foveolar')
+se.harmony$Cluster = factor(cluster.ids[as.numeric(se.harmony$seurat_clusters)])
+
+# Generate a dotplot here consisting of relevant markers
+markers.ciliated <- c('ZMYND10','DTHD1','TMEM190')
+markers.cycling <- c('MKI67','CENPF','TOP2A','CDC20')
+markers.gastric <- c('MUC6','MUC5AC','CLDN18','PGC','GKN1','GKN2','TFF2')
+markers.intestinal <- c('REG4','TFF3','CDX2','GPA33')
+markers.metaplastic <- c('KRT15','HOXB2','HOXB5','HOXB6','HOXB7','HOXB8')
+markers.metaplastic_others <- c('SNAI1','DLX2','CD44','TGFBI') # this includes EMT, stem, and TGFb
+
+DotPlot(se.harmony,
+        features = c(markers.ciliated, markers.cycling, markers.gastric,
+                     markers.intestinal, markers.metaplastic, markers.metaplastic_others),
+        group.by = 'Cluster') +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 8),
+        axis.text.y = element_text(size = 8), 
+        legend.title = element_text(size = 10), legend.text = element_text(size = 10)) +
+  labs(x='', y='')
+
+# We would also like to demonstrate how mucin expression varies across normal->dysplasia
+se.harmony$Origin <- sapply(se.harmony$Origin, function(x) ifelse(x %in% c('NG','GOJ'), 'NG/GOJ',x))
+se.harmony$Origin <- factor(se.harmony$Origin, levels = c('NG/GOJ','NDBO','dysplasia'))
+se.harmony$Sample.ID.full <- factor(se.harmony$Sample.ID.full, levels = levels(df.cell_counts$Sample.ID.full))
+
+dittoSeq::dittoDotPlot(se.harmony, vars = paste0('HOXB',c(8:5,2)), 
+                       group.by = "Sample.ID.full", split.by = "Origin", 
+                       split.adjust = list(scales = "free_x", space = "free_x")) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 8),
+        axis.text.y = element_text(size = 8), 
+        legend.title = element_text(size = 10), 
+        legend.text = element_text(size = 10)) +
+    labs(x='', y='') + coord_flip()
+
+# Then demonstrate concordance in a UMAP
+cluster_cols <- c('purple4','yellow3','goldenrod3','red3','red','indianred','lightpink2',
+                  'yellowgreen','green4','lightseagreen','green2','chartreuse3') # green2 was green3
+DimPlot(se.harmony, reduction = 'umap', group.by = 'Cluster') +
+  scale_color_manual(values = cluster_cols) +
+  ggtitle('')
+
+# Finally, demonstrate distributions across organoids
+df.cluster_pdo <- data.frame(
+  Cluster = se.harmony$Cluster,
+  Organoid = se.harmony$Sample.ID.full,
+  Origin = as.character(se.harmony$Origin),
+  Patient = se.harmony$Patient.ID,
+  Treatment = se.harmony$Treatment
+) %>%
+  # mutate(Origin = factor(Origin, levels = c('NG','GOJ','NDBO','dysplasia'))) %>%
+  # arrange(Origin, Patient, Treatment) %>%
+  # mutate(Origin = sapply(as.character(Origin), function(x) ifelse(x %in% c('NG','GOJ'), 'NG/GOJ',x))) %>%
+  # mutate(Origin = factor(Origin, levels = c('NG/GOJ','NDBO','dysplasia'))) %>%
+  group_by(Cluster, Organoid, Origin) %>% summarise(cell_count = n())
+
+# Get index for reordering of clusters
+cluster.names <- sort(unique(df.cluster_pdo$Cluster)) %>% as.character
+cluster.index <- c(1,4:7,10:12,9:8,2:3)
+
+df.cluster_pdo$Cluster <- factor(df.cluster_pdo$Cluster, levels = cluster.names[cluster.index])
+
+df.cluster_pdo$Origin <- factor(df.cluster_pdo$Origin, levels = c('NG/GOJ','NDBO','dysplasia'))
+ggplot(df.cluster_pdo, aes(x = Organoid, y = cell_count, fill = Cluster)) + 
+  theme_bw() + geom_bar(stat = 'identity', position = 'fill') +
+  facet_wrap(~Origin, nrow=1, scales = 'free_x', space='free_x') +
+  theme(legend.position = 'top', legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = '', y = 'Overall Cluster Proportions')  +
+  scale_fill_manual(values = cluster_cols[cluster.index])
+
+```
+
+From this, we can see that, as expected, NG- and GOJ-derived organoids are strongly represented by normal gastric cells (specifically basal and foveolar, though leaning towards basal), BE organoids are characterised by metaplastic cells (i.e. those positive for gastric and intestinal markers), and dysplastic organoids are characterised either by cycling cells or by metaplastic cells (this particular metaplastic cluster is defined primarily by strong intestinal phenotype).
+
+We note the lack of what appear to be goblet cells (TFF2-positive) within the BE organoids. In Nowicki-Osuch, Zhuang et al. (2023), the 'intestinal' cells were defined by a combination of goblet cells (purely intestinal) and those defined as 'intestinal undifferentiated' or 'enterocyte intermediate', both of which show fairly substantial gastric and intestinal phenotypes. Therefore, we can suggest that these organoids are faithfully recapitualting the cellular landscape of Barrett oesophagus.
+
+We also see that AHM2165 is defined strongly by cycling cells. This organoid was derived from a highly dysplastic region, including mutations in TP53 and ARID1A, chromosomal instability (defined by changes from diploid) and genomic instability). Whilst AHM2221 appears to carry a TP53 mutation and increased TMB, it harbours fewer driver alterations and is decidedly diploid, explaining its maintained metaplastic identity.
+
+## Comparison of cell types across culture media
+
+We can demonstrate where there may be discrepancies in cell types represented in the organoid based on culture media.
+
+```{r cell-types-by-media}
+# UMAP plots separated by media (highlights reduced representation of cycling cells with OWR)
+DimPlot(se.harmony, reduction = 'umap', group.by = 'Cluster', split.by = 'Treatment')  +
+  scale_color_manual(values = cluster_cols) +
+  ggtitle('UMAP of organoids: separate by culture media')
+
+# Summarise and quantify cell type proportions
+df.cluster_treatment <- data.frame(
+  Cluster = se.harmony$Cluster,
+  Treatment = se.harmony$Treatment
+) %>% 
+  group_by(Cluster, Treatment) %>% summarise(cell_count=n())
+
+ggplot(df.cluster_treatment, aes(x = Cluster, y = cell_count, fill = Treatment)) + 
+  theme_bw() + geom_bar(stat = 'identity', position = 'fill') +
+  geom_hline(col = 'black', linetype = 'dashed', 
+             yintercept = sum(se.harmony$Treatment == 'OWR')/length(se.harmony$Treatment)) + # this line represents the overall proportion of cells derived from OWR-treated organoids, to act as a reference
+  theme(legend.position = 'top', axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = '', y = 'Overall Cluster Proportions') +
+  scale_fill_brewer(palette = 'Set2')
+
+```
+
+As shown from both the UMAP and summary barplot, the INC media appears to better support cycling cells, whilst gastric basal (the largest normal gastric cell cluster) is supported better by OWR media.
+
+## Cell Cycle Scoring
+
+Finally, we wanted to to further check differences between the cycling and metaplastic clusters. In particular, the two cycling clusters are most strongly represented in AHM2165 organoids, although whilst 'Cycling 2' appears unique to these organoids, 'Cycling 1' is somewhat represented across organoids.
+
+To check this, we can see what stages of the cell cycle these cells tend to appear in.
+
+```{r cell-cycle-scoring}
+# Define cell cycle scores
+se.harmony <- CellCycleScoring(
+  se.harmony,
+  g2m.features = cc.genes.updated.2019$g2m.genes,
+  s.features = cc.genes.updated.2019$s.genes
+)
+
+# Summarise cell counts
+df.cycling_phase <- data.frame(
+  Cluster = se.harmony$Cluster,
+  CellCyclePhase = se.harmony$Phase
+  
+) %>% 
+  # dplyr::filter(grepl(pattern = 'Cycling', Cluster) |
+  #          grepl(pattern = 'Metaplastic', Cluster)) %>%
+  group_by(Cluster, CellCyclePhase) %>% summarise(cell_count=n())
+
+ggplot(df.cycling_phase, aes(x = Cluster, y = cell_count, fill = CellCyclePhase)) +
+  theme_bw() + geom_bar(stat = 'identity', position = 'fill') +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        legend.position = 'top') +
+  labs(x = '', y = 'Cell Proportions') +
+  scale_fill_brewer(palette = 'Accent')
+
+```
+
+It appears that cell cycle stage is a strong differentiator of the two cycling clusters, with 'Cycling 1' defined primarily by G2/M, and 'Cycling 2' by S phase. This also highlights how the 'Metaplastic Cycling' cluster shows similarities with the AHM2165 cycling cells, given representation of G2/M and S-phase cells.
+
+One key deviator here appears to be the 'Gastric Intermediate' cells. This is a curious, small set of cells which show high gastric markers and somewhat intermediate cycling markers, hence why they fall close to the cycling cells in the UMAP. However, they are almost entirely represented by normal gastric organoids (DE27 for OWR, DE04 for INC). This may highlight to a small population of cycling cells within the normal gastric organoids, which is likely unsurprising given the success with which they can grow.
+
+```{r session-info}
+sessionInfo()
+```
+

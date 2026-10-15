@@ -65,6 +65,9 @@ meta$index_corrected <- as.character(
 ## Remove OAC samples (these are present in the other oncoplot)
 meta <- meta %>% dplyr::filter(`Tissue/Organoid Grade` != 'EAC')
 
+## Fix 'OC/AH/' to 'CAM'
+meta$`Patient ID` <- sapply(meta$`Patient ID`, function(x) str_replace(x,'OC/AH/','CAM'))
+
 ## Replace 'Normal' with 'Normal (Healthy)' (if Highest grade == 'Normal donor') and 'Normal (Patient)' otherwise
 meta$`Tissue/Organoid Grade`[meta$`Highest grade` == 'Normal donor'] <- 'Normal (Healthy)'
 meta$`Tissue/Organoid Grade`[meta$`Tissue/Organoid Grade` == 'Normal'] <- 'Normal (Patient)'
@@ -178,8 +181,9 @@ Copy number and ploidy information are gathered by loading Caveman output and th
 
 ```{r load copy number information}
 # Load positions of OAC driver genes
-mart = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="feb2014.archive.ensembl.org", path="/biomart/martservice",
-               dataset="hsapiens_gene_ensembl")
+# mart = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="feb2014.archive.ensembl.org", path="/biomart/martservice",
+#                dataset="hsapiens_gene_ensembl")
+load('~/Documents/Data/mart.homosapiens.hg19.Rdata')
 gene_positions <- getBM(
   attributes = c('hgnc_symbol','chromosome_name','start_position','end_position'),
   filters = c('hgnc_symbol'),
@@ -245,6 +249,7 @@ muts.oac <- rbind(vep.oac[,c('sequence_id','Patient ID','Gene','Organoid or Tiss
 
 # Check number of samples with any kind of coding OAC-linked driver events
 print(table(unique(meta$`Patient ID`) %in% muts.oac$`Patient ID`))
+
 
 ```
 
@@ -321,7 +326,7 @@ df.tmb %>%
   filter(!is.na(Stage)) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = tmb) %>%
   ggplot(aes(x = Tissue, y = Organoids)) + theme_bw() + 
-  geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor()  +
+  geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy=0.001)  +
   theme(legend.position = 'top', legend.title = element_blank()) +
   labs(x = 'Total Mutations (tissue)', y = 'Total Mutations (organoid)') +
   scale_color_manual(values = c('red1','brown')) +
@@ -336,7 +341,7 @@ df.tmb %>%
   filter(!is.na(Stage)) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = tmb) %>%
   ggplot(aes(x = Tissue, y = Organoids, color = Stage)) + theme_bw() + 
-  geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   theme(legend.position = 'top', legend.title = element_blank()) +
   labs(x = 'Total Mutations (tissue)', y = 'Total Mutations (organoid)') +
   scale_color_manual(values = c('red1','brown')) +
@@ -402,7 +407,7 @@ for (file in files.ploidy) {
 }
 
 # Combine with metdata (for the sake of initial comparison)
-df.ascatAnno <- merge(x = df.ascatAnno, y = meta[,c('index_corrected','Patient ID','Organoid or Tissue')],
+df.ascatAnno <- merge(x = df.ascatAnno, y = meta[,c('index_corrected','Patient ID','Organoid or Tissue','Passage')],
                       by.x = 'sequence_id', by.y = 'index_corrected')
 
 df.ascatAnno %>%
@@ -430,7 +435,7 @@ ggsave(filename = 'Results/OrganoidsGastricBO_concordancePloidy.pdf',
 #   geom_point() + xlim(c(0,1)) + ylim(c(0,1)) +
 #   labs(x = 'Purity (tissue)', y = 'Purity (organoid)') +
 #   theme(legend.position = 'top', legend.title = element_blank())
-# # ggsave(filename = 'Results/OrganoidsGastricBO_concordancePurity.pdf')
+# ggsave(filename = 'Results/OrganoidsGastricBO_concordancePurity.pdf')
 
 df.ascatAnno %>%
   dplyr::select(`Patient ID`, `Organoid or Tissue`, Purity) %>%
@@ -564,7 +569,7 @@ df.scarHRD %>%
   filter(Stage %in% c('BO No dysplasia','Dysplasia')) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = `HRD-sum`) %>%
   ggplot(aes(x = Tissue, y = Organoids)) + 
-  theme_bw() + geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor() +
+  theme_bw() + geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   theme(legend.position = 'top', legend.title = element_blank()) +
   scale_color_manual(values = c('red1','brown')) +
   geom_abline(col = 'black', linetype = 'dashed', slope = 1, intercept = 0) +
@@ -579,7 +584,7 @@ df.scarHRD %>%
   filter(Stage %in% c('BO No dysplasia','Dysplasia')) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = `HRD-sum`) %>%
   ggplot(aes(x = Tissue, y = Organoids, color = Stage)) + 
-  theme_bw() + geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  theme_bw() + geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   theme(legend.position = 'top', legend.title = element_blank()) +
   scale_color_manual(values = c('red1','brown')) +
   geom_abline(col = 'black', linetype = 'dashed', slope = 1, intercept = 0) +
@@ -590,16 +595,18 @@ ggsave(filename = 'Results/OrganoidsGastricBO_concordanceHRDscore_byStage.pdf',
 
 # # We can also compare how HRD scores change throughout progression in the organoids
 # df.scarHRD_plot <- df.scarHRD %>% filter(`Organoid or Tissue` == 'Organoids')
-# df.scarHRD_plot$Group <- factor(sapply(df.scarHRD_plot$`Patient ID`, function(x)
-#   strsplit(x,split='_')[[1]][2]),
-#   levels = c('Normal (Healthy)','Normal (Patient)','BO No dysplasia','Dysplasia'))
+# # df.scarHRD_plot$Group <- factor(sapply(df.scarHRD_plot$`Patient ID`, function(x)
+# #   strsplit(x,split='_')[[1]][2]),
+# #   levels = c('Normal (Healthy)','Normal (Patient)','BO No dysplasia','Dysplasia'))
+# df.scarHRD_plot$Group <- sapply(df.scarHRD_plot$`Patient ID`, function(x) strsplit(x,split='_')[[1]][2])
+# df.scarHRD_plot <- df.scarHRD_plot %>% filter(Group %in% c('BO No dysplasia','Dysplasia'))
 # names(df.scarHRD_plot)[which(names(df.scarHRD_plot) == 'HRD-sum')] <- 'HRD score'
 # ggboxplot(df.scarHRD_plot, x = 'Group', y = 'HRD score', add = 'jitter', color = 'Group')  +
 #   theme(legend.title = element_blank(), axis.text.x = element_blank()) +
 #   labs(x = '', y = 'HRD index score') +
-#   geom_hline(yintercept = 42, col = 'red', linetype = 'dashed')
-# # ggsave(filename = 'Results/OrganoidsGastricBO_HRDbyStatus.pdf',
-# #        width = 5, height = 5)
+#   stat_compare_means()
+# ggsave(filename = 'Results/OrganoidsGastricBO_HRDbyStatus.pdf',
+#        width = 5, height = 5)
 
 ```
 
@@ -794,7 +801,7 @@ sigs.extracted_complete %>%
   mutate(Proportion = 100 * Proportion) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = Proportion) %>%
   ggplot(aes(x = Tissue, y = Organoids)) + theme_bw() +
-  geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point(aes(color = Stage)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   geom_abline(col = 'black', linetype = 'dashed', slope = 1, intercept = 0) +
   scale_color_manual(values = c('red1','brown')) +
   labs(x = 'Signature % (tissue)', y = 'Signature % (organoid)') +
@@ -813,7 +820,7 @@ sigs.extracted_complete %>%
   mutate(Proportion = 100 * Proportion) %>%
   pivot_wider(names_from = `Organoid or Tissue`, values_from = Proportion) %>%
   ggplot(aes(x = Tissue, y = Organoids, color = Stage)) + theme_bw() +
-  geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   geom_abline(col = 'black', linetype = 'dashed', slope = 1, intercept = 0) +
   labs(x = 'Signature % (tissue)', y = 'Signature % (organoid)') +
   scale_color_manual(values = c('red1','brown')) +
@@ -943,7 +950,7 @@ Here, we will collate the genomic features we have profiled previously (TMB, plo
 ```{r prepare annotation data}
 
 # Collate genomic features we have collected here. Note that for the Birmingham organoids we are restricted to TMB and ploidy
-muts.oac_ann <- df.ascatAnno[,c('sequence_id','Patient ID','Organoid or Tissue','Ploidy','Purity')] # start with ploidy/purity
+muts.oac_ann <- df.ascatAnno[,c('sequence_id','Patient ID','Organoid or Tissue','Passage','Ploidy','Purity')] # start with ploidy/purity
 muts.oac_ann <- merge(x = muts.oac_ann, y = df.tmb, all.x = TRUE) # add TMB
 muts.oac_ann <- merge(x = muts.oac_ann, y = df.scarHRD[,c('sequence_id','Patient ID','Organoid or Tissue','HRD-sum')], all.x = TRUE) # add HRD index score
 muts.oac_ann <- merge(x = muts.oac_ann, y = df.sig17, all.x = TRUE) # add SBS17
@@ -968,6 +975,8 @@ muts.oac_ann$`Tissue/Organoid Grade` <- factor(muts.oac_ann$`Tissue/Organoid Gra
 muts.oac_ann$HighestGrade <- factor(muts.oac_ann$HighestGrade,
                                     levels = c('Normal donor','BO No dysplasia','LGD',
                                                'OAC','Gastric cancer'))
+
+muts.oac_ann$Passage <- sapply(muts.oac_ann$Passage, function(x) as.numeric(str_replace(x,'P','')))
 
 muts.oac_ann <- muts.oac_ann %>% arrange(`Tissue/Organoid Grade`, `Patient ID`, desc(`Organoid or Tissue`))
 
@@ -1070,7 +1079,7 @@ muts.oac_ann$column_name <- apply(muts.oac_ann, 1, function(x)
 colnames(muts.oac_plot) <- muts.oac_ann$column_name
 
 # Final oncoprint formation
-# pdf('Results/Oncoplot_GastricBEtissuesOrganoids.pdf', width = 16, height = 12)
+pdf('Results/Oncoplot_GastricBEtissuesOrganoids.pdf', width = 16, height = 12)
 oncoPrint(muts.oac_plot,
           alter_fun = alter_fun, col = col.bars,
           column_split = data.frame(muts.oac_ann$`Tissue/Organoid Grade`, muts.oac_ann$`Patient ID`),
@@ -1086,6 +1095,7 @@ oncoPrint(muts.oac_plot,
             #                                            colors = c('white','pink3'))),
             `Sex` = muts.oac_ann$Sex,
             `Site` = muts.oac_ann$`Type/site`,
+            Passage = muts.oac_ann$Passage,
             `Highest Grade` = muts.oac_ann$HighestGrade,
             `Grade` = muts.oac_ann$`Tissue/Organoid Grade`,
             `Tissue/Organoid` = muts.oac_ann$`Organoid or Tissue`,
@@ -1101,7 +1111,9 @@ oncoPrint(muts.oac_plot,
                                            'BO No dysplasia' = 'plum2', 'LGD' = 'plum3',
                                            'OAC' = 'purple3', 'Gastric cancer' = 'mediumorchid4'),
                        `Signature 17` = colorRamp2(c(0,max(muts.oac_ann$SBS17, na.rm = TRUE)),colors = c('white','green4')),
-                       `Age` = colorRamp2(c(50,max(muts.oac_ann$Age, na.rm = TRUE)),colors=c('white','gold3')))
+                       Passage = colorRamp2(c(1,max(muts.oac_ann$Passage, na.rm=TRUE)), colors = c('darkslategray1','darkslategray4')),
+                       `Age` = colorRamp2(c(30,max(muts.oac_ann$Age, na.rm = TRUE)),colors=c('white','gold3'))),
+            na_col = 'gray75'
           ),
           right_annotation = rowAnnotation(
             Tissue = anno_barplot(annoMut.tissue, gp=gpar(fill = col.bars)),
@@ -1111,7 +1123,7 @@ oncoPrint(muts.oac_plot,
           column_order = colnames(muts.oac_plot),
           show_column_names = TRUE,
           show_pct = FALSE)
-# dev.off()
+dev.off()
 
 # Save annotation
 write.csv(muts.oac_ann, file = 'Results/Oncoplot_GastricBE_annotation.csv')
@@ -1143,7 +1155,7 @@ The final step of this analysis is to demonstrate the level of concordance in mu
 ```{r comapre VAF distribution}
 
 # Add metadata
-vcfs.full <- merge(x = vcfs.all, y = meta[,c('index_corrected','Patient ID','Organoid or Tissue')],
+vcfs.full <- merge(x = vcfs.all, y = meta[,c('index_corrected','Patient ID','Organoid or Tissue','Passage')],
                    by.x = 'sequence_id', by.y = 'index_corrected')
 
 # This will only be relevant to SNVs, so we extract these
@@ -1163,7 +1175,7 @@ ggplot(vcfs.shared, aes(x = VAF_diff)) + theme_bw() +
   geom_histogram(bins = 50, fill = 'steelblue', color = 'white') +
   geom_vline(col = 'red', linetype = 'dashed', xintercept = 0) +
   xlab('VAF (organoid) - VAF (tissue)')
-# ggsave(filename = 'Results/OrganoidsGastricBO_differencesVAF.pdf', height = 5, width = 5)
+ggsave(filename = 'Results/OrganoidsGastricBO_differencesVAF.pdf', height = 5, width = 5)
 
 # Label mutations as Concordant, Organoid_only, or Tissue_only, add case_id and summarise counts of each
 vcfs.shared$Label <- 'Concordant'
@@ -1211,7 +1223,7 @@ ggsave(filename = 'Results/OrganoidsGastricBO_concordanceWGS.pdf', height = 5)
 
 ```
 
-However, could it be that the sample purity is what drives the concordane, or lack thereof?
+However, could it be that the sample purity is what drives the concordance, or lack thereof?
 
 ```{r compare concordance and purity of original sample}
 muts.concordant_purity <- merge(x = muts.concordant[,c('case_id','percentage_Concordant')],
@@ -1220,8 +1232,49 @@ muts.concordant_purity <- merge(x = muts.concordant[,c('case_id','percentage_Con
 
 ggplot(muts.concordant_purity, aes(x = 100*Purity, y = 100*percentage_Concordant)) + 
   theme_bw() +
-  geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy=.001) +
   labs(x = 'Purity (%)', y = 'Proportion of Concordant Mutations (%)')
+```
+
+We can also check if PDO passage is linked with VAF distributions, as we investigate further with AHM/1373
+
+```{r check VAF distributions across passages}
+# Subset all SNVs for those in PDOs specifically
+vcfs.full_pdos <- vcfs.full %>% dplyr::filter(`Organoid or Tissue` == 'Organoids')
+vcfs.full_pdos$Label <- apply(vcfs.full_pdos, 1, function(x) paste(x[c('Patient ID','Passage')], collapse='_'))
+vcfs.full_pdos$Grade <- sapply(vcfs.full_pdos$`Patient ID`, function(x) strsplit(x,split='_')[[1]][2])
+
+# Order 'Patient ID' by grade and increasing passage
+vcfs.full_pdos_patient_passage <- vcfs.full_pdos %>%
+  group_by(`Patient ID`, Passage) %>% summarise() %>%
+  mutate(Grade = factor(sapply(`Patient ID`, function(x) strsplit(x,split='_')[[1]][2]),
+                        levels = c('Normal (Healthy)','Normal (Patient)','BO No dysplasia','Dysplasia')))
+vcfs.full_pdos_patient_passage$Label <- apply(vcfs.full_pdos_patient_passage, 1, function(x) paste(x[c('Patient ID','Passage')], collapse='_'))
+vcfs.full_pdos_patient_passage <- vcfs.full_pdos_patient_passage %>% arrange(Grade, Passage)
+
+# Convert Label into a factor, and plot VAF distributions as violins
+vcfs.full_pdos$Label <- factor(vcfs.full_pdos$Label, levels = vcfs.full_pdos_patient_passage$Label)
+vcfs.full_pdos$Grade <- factor(vcfs.full_pdos$Grade, levels = c('Normal (Healthy)','Normal (Patient)','BO No dysplasia','Dysplasia'))
+
+ggplot(vcfs.full_pdos, aes(x = Label, y = VAF, fill = Grade)) + theme_bw() +
+  geom_violin(width = 2) + theme(legend.title = element_blank(), legend.position = 'top') +
+  labs(x = '',y = 'Variant Allele Frequency') +
+  scale_fill_manual(values = c('yellow2','orange','red1','brown')) +
+  scale_x_discrete(labels = vcfs.full_pdos_patient_passage$Passage)
+
+# And numerically compare passage with mean VAF
+vcfs.full_pdos %>% 
+  group_by(Grade, Label, Passage) %>% summarise(mean_VAF = mean(VAF), median_VAF = median(VAF)) %>%
+  mutate(Passage_Number = as.numeric(str_replace(Passage,'P',''))) %>%
+  ggplot(aes(x = Passage_Number, y = mean_VAF, color = Grade)) + theme_bw() + 
+  geom_smooth(method = 'lm') +
+  geom_point() + theme(legend.position = 'top', legend.title = element_blank()) + 
+  scale_color_manual(values = c('yellow3','orange','red1','brown')) +
+  labs(x = 'Passage Number', y = 'Mean Variant Allele Frequency') +
+  geom_hline(col = 'black', linetype = 'dashed', yintercept = 0.5) +
+  scale_x_continuous(breaks = seq(0,8,2)) +
+  stat_cor(method = 'spearman', label.y = .6, p.accuracy = .001, cor.coef.name = 'rho') +
+  facet_wrap(~Grade, nrow=1)
 ```
 
 
@@ -1260,7 +1313,7 @@ ggplot(snvs_ahm1373.all, aes(x = 100*VAF)) + theme_bw() +
   geom_histogram(breaks = seq(0,100,by=2), fill = 'steelblue') + 
   facet_wrap(~SAMPLE_ID) +
   labs(x = 'Variant Allele Frequency (%)', y = '')
-# ggsave(filename = 'Results/AHM1373_VAFdistributions.pdf', height = 5)
+ggsave(filename = 'Results/AHM1373_VAFdistributions.pdf', height = 5)
 
 
 ```
@@ -1288,8 +1341,8 @@ ggplot(muts.shared, aes(x = 100*`OGD_AHM1371_BE.P1`, y = 100*`OGD_AHM1371_BE.P6`
   labs(x = 'Variant Allele Frequency at Passage 1 (%)',
        y = 'Variant Allele Frequency at Passage 6 (%)') +
   ggtitle('Clonal Dynamics of AHM/1373')
-# ggsave(filename = 'Results/AHM1373_ClonalDynamics.pdf',
-#        width = 7, height = 5)
+ggsave(filename = 'Results/AHM1373_ClonalDynamics.pdf',
+       width = 7, height = 5)
 
 
 ```
@@ -1342,7 +1395,7 @@ ggboxplot(ann_full, x = 'Stage', y = 'value', add = 'jitter', color = 'Stage') +
   scale_color_manual(values = c('navy','blue','darkgreen','green3',
                                 'yellow4','darkorange','red3','brown','gray50')) +
   facet_wrap(~Feature, scales = 'free')
-# ggsave(filename = 'Results/FullOrganoids_FeatureSet.pdf', height = 6, width = 9)
+ggsave(filename = 'Results/FullOrganoids_FeatureSet.pdf', height = 6, width = 9)
 
 ```
 
@@ -1410,7 +1463,11 @@ drivers.counts %>%
   facet_wrap(~Group, nrow = 1, scales = 'free_y') +
   xlim(c(0,100)) +
   labs(x = 'Proportion of Organoids (%)', y = 'OAC Driver Gene')
-# ggsave(filename = 'Results/FullOrganoids_AlterationSet.pdf', height = 5)
+ggsave(filename = 'Results/FullOrganoids_AlterationSet.pdf', height = 5)
 
+```
+
+```{r session-info}
+sessionInfo()
 ```
 

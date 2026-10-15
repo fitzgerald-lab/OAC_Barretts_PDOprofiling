@@ -311,6 +311,8 @@ df.zfhx3_add <- data.frame(
   Present = 1
 )
 vep.oac <- rbind(vep.oac, df.zfhx3_add)
+
+write.csv(vep.oac, file = 'Results/ClonalOrganoids_AHM2149_summaryVEP.csv')
 ```
 
 
@@ -328,14 +330,16 @@ df.ploidy <- data.frame()
 
 # In this case, we will start with the gene list and match the copy number profiles
 
-mart <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="https://grch37.ensembl.org", 
-                path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+# mart <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="https://grch37.ensembl.org", 
+#                 path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+load('~/Documents/Data/mart.homosapiens.hg19.Rdata')
 gene_positions <- getBM(
   attributes = c('hgnc_symbol','chromosome_name','start_position','end_position'),
   filters = c('hgnc_symbol'),
   values = list(gene_drivers),
   mart=mart
-)
+) %>%
+  dplyr::filter(chromosome_name %in% 1:22)
 
 # Define 'by' statement for joining with caveman output
 by = join_by(
@@ -399,6 +403,7 @@ muts.oac <- muts.oac %>% dplyr::filter(grepl(pattern = 'missense_variant', mutat
                                   grepl(pattern = 'stop_gained', mutationType) |
                                   grepl(pattern = 'inframe_', mutationType) |
                                   grepl(pattern = 'NMD_transcript_variant', mutationType) |
+                                  grepl(pattern = '3_prime_UTR_variant', mutationType) |
                                   mutationType %in% c('Deletion','Loss','Amplification'))
 muts.oac$mutationType[grepl(pattern = 'NMD_transcript_variant', muts.oac$mutationType)] <- 'NMD_transcript_variant'
 muts.oac$mutationType[muts.oac$mutationType == 'frameshift_variant,splice_region_variant'] <- 'frameshift_variant'
@@ -446,12 +451,14 @@ annoMut <- muts.oac %>%
 # Information for oncoplot input
 col.bars = c("Loss" = "lightblue",
              'inframe_deletion' = 'orange3', 
-             'missense_variant' = 'red2', 'NMD_transcript_variant' = 'darkgreen')
+             'missense_variant' = 'red2', 'NMD_transcript_variant' = 'darkgreen',
+             '3_prime_UTR_variant' = 'yellow2')
 alter_fun = list(
   background = alter_graphic("rect", fill = "gray90"),   
   Loss = alter_graphic("rect", fill = col.bars["Loss"]),
   inframe_deletion = alter_graphic("rect", height = 0.33, fill = col.bars["inframe_deletion"]),
   missense_variant = alter_graphic("rect", height = 0.33, fill = col.bars["missense_variant"]),
+  `3_prime_UTR_variant` = alter_graphic("rect", height = 0.33, fill = col.bars["3_prime_UTR_variant"]),
   NMD_transcript_variant = alter_graphic("rect", height = 0.33, fill = col.bars["NMD_transcript_variant"])
 )
 
@@ -493,8 +500,9 @@ oncoPrint(muts.oac_plot,
 dev.off()
 
 # Save coding alterations
-muts.oac <- merge(x = muts.oac, y = muts.oac_ann[,c('sequence_id','SampleID_short')]) %>%
-  dplyr::filter(!(SampleID_short %in% c('BO.tissue','BO.bulk')))
+# muts.oac <- merge(x = muts.oac, y = muts.oac_ann[,c('sequence_id','SampleID_short')]) %>%
+#   dplyr::filter(!(SampleID_short %in% c('BO.tissue','BO.bulk')))
+muts.oac <- merge(x = muts.oac, y = muts.oac_ann[,c('sequence_id','SampleID_short')])
 names(muts.oac)[5] <- 'case_id'
 write.csv(muts.oac, file = 'Results/ClonalOrganoids_AHM2149_codingAlterations.csv')
 
@@ -954,5 +962,9 @@ ggplot(gsva.sigs, aes(x = Intestinal, y = Gastric, label = sample_ID)) +
   geom_text_repel() + coord_obs_pred()
 ggsave(filename = 'Results/AHM2149_RNAseq_GastricIntestinalScores.pdf')
 
+```
+
+```{r session-info}
+sessionInfo()
 ```
 

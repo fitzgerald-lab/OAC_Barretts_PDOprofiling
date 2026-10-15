@@ -46,7 +46,7 @@ We will also organise our respective metadata in order to ensure that there is o
 meta <- read.csv('Data/case_sex_spec_pheno_source_site_pass_seq_strat_oc748_20250513.csv', row.names = 1)
 
 meta.wgs <- meta %>% 
-  filter(strategy == 'whole-genome' &
+  dplyr::filter(strategy == 'whole-genome' &
            # grepl(pattern = 'OCCAMS', case_id) &
            specimen_phenotype == 'oac' &
            specimen_source %in% c('tissue','organoid'))
@@ -55,11 +55,14 @@ meta.wgs <- meta %>%
 cases_remove.dupTissue <- c('LP6008460-DNA_H03','PD44940a','PD44783a','LP2101132-DNA_A01')
 
 meta.wgs <- meta.wgs %>%
-  filter(!(sequence_id %in% cases_remove.dupTissue))
+  dplyr::filter(!(sequence_id %in% cases_remove.dupTissue))
+
+# Relabel the case_id for specimen OC/AH/453/L/T4 (this is staging lap for CAM453)
+meta.wgs$case_id[meta.wgs$specimen_id == 'OC/AH/453/L/T4'] <- 'OCCAMS/AH/453L'
 
 # Remove late-passage organoids ('NA' is equivalent to 1)
 #   In cases with equal passage values, the first alphabetically is selected
-meta.wgs_organoid <- meta.wgs %>% filter(specimen_source == 'organoid')
+meta.wgs_organoid <- meta.wgs %>% dplyr::filter(specimen_source == 'organoid')
 meta.wgs_organoid$passage[is.na(meta.wgs_organoid$passage)] <- 1
 
 cases_remove.lateOrganoid <- meta.wgs_organoid %>%
@@ -69,7 +72,7 @@ cases_remove.lateOrganoid <- meta.wgs_organoid %>%
 cases_remove.lateOrganoid <- cases_remove.lateOrganoid$sequence_id
 
 meta.wgs <- meta.wgs %>%
-  filter(!(sequence_id %in% cases_remove.lateOrganoid))
+  dplyr::filter(!(sequence_id %in% cases_remove.lateOrganoid))
 
 ```
 
@@ -111,7 +114,7 @@ for (file in vep.files) {
       
       vep.i <- vep.i[,c(1,2,3,11,18)]
       names(vep.i) <- c('occams.ID','sequence_id','mutationID','mutationType','Extra')
-      vep.i <- vep.i %>% filter(!duplicated(mutationID))
+      vep.i <- vep.i %>% dplyr::filter(!duplicated(mutationID))
       vep.i$Gene <- sapply(vep.i$Extra, function(x)
         strsplit(strsplit(x,split=';')[[1]][2],split='=')[[1]][2])
       
@@ -122,9 +125,15 @@ for (file in vep.files) {
       # For some reason, the newest batch has 'M' at V1 instead of the OCCAMS_ID
       if (grepl(pattern='SLX-21369',file)) vep.i$V1 = 'OCCAMS/AH/748'
       
+      # Additionally, samples from OCCAMS/AH/574 and OCCAMS/AH/576 have mislabelled sequence IDs
+      if (grepl(pattern = '2126_WTSI-OESO_224', file) | grepl(pattern = '2126_WTSI-OESO_211', file)) {
+        vep.i[,2] <- sapply(vep.i[,2], function(x)
+          str_replace(x, pattern = '1631', replacement = '2126'))
+      }
+      
       vep.i <- vep.i[,c(1,2,3,9,16)]
       names(vep.i) <- c('occams.ID','sequence_id','mutationID','mutationType','Extra')
-      vep.i <- vep.i %>% filter(!duplicated(mutationID))
+      vep.i <- vep.i %>% dplyr::filter(!duplicated(mutationID))
       vep.i$Gene <- sapply(vep.i$Extra, function(x)
         strsplit(strsplit(x,split=';')[[1]][2],split='=')[[1]][2])
       
@@ -141,7 +150,7 @@ for (file in vep.files) {
 }
 
 # Subset for OAC driver genes, and extract sequence_id for OAC sample
-vep.oac <- vep.full %>% filter(Gene %in% gene_drivers)
+vep.oac <- vep.full %>% dplyr::filter(Gene %in% gene_drivers)
 vep.oac$sequence_id <- sapply(vep.oac$sequence_id, function(x)
   strsplit(x,split='_vs_')[[1]][1])
 
@@ -152,6 +161,8 @@ vep.oac <- merge(x = vep.oac, y = meta.wgs[,c('sequence_id','specimen_source')])
 vep.oac$occams.ID <- sapply(vep.oac$occams.ID, function(x) gsub('OC/AH/','OCCAMS/AH/',x))
 vep.oac$occams.ID <- sapply(vep.oac$occams.ID, function(x) gsub('^AH/','OCCAMS/AH/',x))
 
+# Add in CAM453L for staging lap
+vep.oac$occams.ID[vep.oac$sequence_id == '1631_WTSI-OESO_095_1pre'] <- 'OCCAMS/AH/453L'
 
 ```
 
@@ -161,7 +172,8 @@ Copy number and ploidy information are gathered by loading Caveman output and th
 
 ```{r load copy number information}
 # Load positions of OAC driver genes
-mart = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="feb2014.archive.ensembl.org", path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+# mart = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="feb2014.archive.ensembl.org", path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+load('~/Documents/Data/mart.homosapiens.hg19.Rdata')
 gene_positions <- getBM(
   attributes = c('hgnc_symbol','chromosome_name','start_position','end_position'),
   filters = c('hgnc_symbol'),
@@ -200,6 +212,7 @@ for (i in 1:length(files.caveman)) {
   # Label CNVs based on Li, Francies et al. 2018
   genes.i$CNV <- NA
   # genes.i$CNV[genes.i$Total_CN >= 1.25*ploidy.i] <- 'Gain'
+  # genes.i$CNV[genes.i$Minor_CN == 0] <- 'LOH'
   genes.i$CNV[genes.i$Total_CN >= 2*ploidy.i] <- 'Amplification'
   # genes.i$CNV[genes.i$Total_CN <= 0.75*ploidy.i] <- 'Loss'
   genes.i$CNV[genes.i$Total_CN == 0] <- 'Deletion'
@@ -220,6 +233,9 @@ for (i in 1:length(files.caveman)) {
 cnv.full <- merge(x = cnv.full, y = meta.wgs[,c('sequence_id','specimen_source','case_id')])
 cnv.oac <- cnv.full [,c('case_id', 'sequence_id', 'hgnc_symbol', 'specimen_source', 'CNV')]
 names(cnv.oac) <- c('occams.ID','sequence_id','Gene','specimen_source','mutationType')
+
+# Fix CAM453 staging lap
+cnv.oac$occams.ID[cnv.oac$sequence_id == '1631_WTSI-OESO_095_1pre'] <- 'OCCAMS/AH/453L'
 
 # Finally, combine the mutation and copy number profiles
 muts.oac <- rbind(vep.oac[,c('occams.ID','sequence_id','Gene','specimen_source','mutationType')], cnv.oac)
@@ -340,15 +356,15 @@ df.tmb %>%
   pivot_wider(names_from = specimen_source, values_from = tmb) -> df.tmb_indel_compare
 ggplot(df.tmb_indel_compare, aes(x = tissue, y = organoid)) + theme_bw() + 
   geom_point(aes(color = `Concordance < 10%`)) + 
-  geom_smooth(method = 'lm') + stat_cor() +
+  geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   geom_smooth(data = df.tmb_indel_compare[df.tmb_indel_compare$`Concordance < 10%` == FALSE,], method = 'lm', color = 'navy') +
   stat_cor(data = df.tmb_indel_compare[df.tmb_indel_compare$`Concordance < 10%` == FALSE,], color = 'navy',
-           label.x.npc = 'centre', label.y.npc = 'bottom') +
+           label.x.npc = 'centre', label.y.npc = 'bottom', p.accuracy = 0.001) +
   labs(x = 'Indel Burden - muts/Mb (tissue)', y = 'Indel Burden - muts/Mb (organoid)') +
   theme(legend.position = 'top') +
   scale_color_manual(values = c('gray50','red')) +
   geom_abline(col = 'red', linetype = 'dashed', slope = 1, intercept = 0)
-# ggsave(filename = 'Results/OrganoidsOAC_concordanceTMB_indels.pdf')
+ggsave(filename = 'Results/OrganoidsOAC_concordanceTMB_indels.pdf')
 
 df.tmb %>% 
   dplyr::filter(mut_type == 'SNV') %>%
@@ -359,15 +375,15 @@ df.tmb %>%
   pivot_wider(names_from = specimen_source, values_from = tmb) -> df.tmb_snv_compare
 ggplot(df.tmb_snv_compare, aes(x = tissue, y = organoid)) + theme_bw() + 
   geom_point(aes(color = `Concordance < 10%`)) + 
-  geom_smooth(method = 'lm') + stat_cor() +
+  geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   geom_smooth(data = df.tmb_snv_compare[df.tmb_snv_compare$`Concordance < 10%` == FALSE,], method = 'lm', color = 'navy') +
   stat_cor(data = df.tmb_snv_compare[df.tmb_snv_compare$`Concordance < 10%` == FALSE,], color = 'navy',
-           label.x.npc = 'centre', label.y.npc = 'bottom') +
+           label.x.npc = 'centre', label.y.npc = 'bottom', p.accuracy = 0.001) +
   labs(x = 'SNV Burden - muts/Mb (tissue)', y = 'SNV Burden - muts/Mb (organoid)') +
   theme(legend.position = 'top') +
   scale_color_manual(values = c('gray50','red')) +
   geom_abline(col = 'red', linetype = 'dashed', slope = 1, intercept = 0)
-# ggsave(filename = 'Results/OrganoidsOAC_concordanceTMB_SNV.pdf')
+ggsave(filename = 'Results/OrganoidsOAC_concordanceTMB_SNV.pdf')
 
 # Finally, save total TMB values
 df.tmb <- df.tmb %>%
@@ -394,7 +410,7 @@ df.tmb[,-1] %>%
   dplyr::filter(!is.na(tissue) & !is.na(organoid)) -> df.tmb_paired
 wilcox.test(x = df.tmb_paired$tissue, y = df.tmb_paired$organoid, paired = TRUE) -> wilcox.test_pairedTMB
 
-ggpaired(df.tmb, x = 'specimen_source', y = 'TMB', line.color = 'gray70', line.size = .2) +
+ggpaired(df.tmb[df.tmb$case_id != 'OCCAMS/AH/453L', ], x = 'specimen_source', y = 'TMB', line.color = 'gray70', line.size = .2) +
   labs(x = '', y = 'TMB (muts/Mb)') +
   ggtitle(paste0('Paired Wilcox test: p = ',round(wilcox.test_pairedTMB$p.value,4)))
 ggsave(filename = 'Results/OrganoidsOAC_TMB_PDOvsTissue.pdf')
@@ -438,15 +454,15 @@ df.ascatAnno %>%
   dplyr::select(case_id, specimen_source, `Concordance < 10%`, Ploidy) %>%
   pivot_wider(names_from = specimen_source, values_from = Ploidy) -> df.ploidy_compare
 ggplot(df.ploidy_compare, aes(x = tissue, y = organoid)) + theme_bw() + 
-  geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   geom_smooth(data = df.ploidy_compare[df.ploidy_compare$`Concordance < 10%` == FALSE,], method = 'lm', color = 'navy') +
   stat_cor(data = df.ploidy_compare[df.ploidy_compare$`Concordance < 10%` == FALSE,], color = 'navy',
-           label.x.npc = 'centre', label.y.npc = 'bottom') +
+           label.x.npc = 'centre', label.y.npc = 'bottom', p.accuracy = 0.001) +
   scale_color_manual(values = c('gray50','red')) +
   theme(legend.position = 'top') +
   labs(x = 'Ploidy (tissue)', y = 'Ploidy (organoid)') +
   geom_abline(col = 'red', linetype = 'dashed', slope = 1, intercept = 0)
-# ggsave(filename = 'Results/OrganoidsOAC_concordancePloidy.pdf', width = 7, height = 7)
+ggsave(filename = 'Results/OrganoidsOAC_concordancePloidy.pdf', width = 7, height = 7)
 
 df.ascatAnno %>%
   dplyr::select(case_id, specimen_source, Purity) %>%
@@ -454,7 +470,7 @@ df.ascatAnno %>%
   ggplot(aes(x = tissue, y = organoid)) + theme_bw() + 
   geom_point() + xlim(0,1) + ylim(0,1) +
   labs(x = 'Purity (tissue)', y = 'Purity (organoid)')
-# ggsave(filename = 'Results/OrganoidsOAC_concordancePurity.pdf')
+ggsave(filename = 'Results/OrganoidsOAC_concordancePurity.pdf')
 
 # Wilcox test comparing purity in PDO vs tissue (for some reason)
 print(paste0('Median Purity for organoids = ',median(df.ascatAnno$Purity[df.ascatAnno$specimen_source == 'organoid'], na.rm = TRUE)))
@@ -558,10 +574,10 @@ df.scarHRD %>%
   dplyr::select(case_id, specimen_source, `HRD-sum`, `Concordance < 10%`) %>%
   pivot_wider(names_from = specimen_source, values_from = `HRD-sum`) -> df.scarHRD_compare
 ggplot(df.scarHRD_compare, aes(x = tissue, y = organoid)) + 
-  theme_bw() + geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor() +
+  theme_bw() + geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   geom_smooth(data = df.scarHRD_compare[df.scarHRD_compare$`Concordance < 10%` == FALSE,], method = 'lm', color = 'navy') +
   stat_cor(data = df.scarHRD_compare[df.scarHRD_compare$`Concordance < 10%` == FALSE,], color = 'navy',
-           label.x.npc = 'centre', label.y.npc = 'bottom') +
+           label.x.npc = 'centre', label.y.npc = 'bottom', p.accuracy = 0.001) +
   geom_abline(col = 'red', linetype = 'dashed', slope = 1, intercept = 0) +
   theme(legend.position = 'top') +
   scale_color_manual(values = c('gray50','red')) +
@@ -709,7 +725,7 @@ for (case in joint_cases) {
 cosineSims <- data.frame(cosineSims, case = joint_cases)
 cosineSims <- cosineSims %>% arrange(cosineSims)
 cosineSims$case <- sapply(cosineSims$case, function(x) 
-  str_replace_all(x, c(`OCCAMS/AH/` = 'CAM', `OCCAMS/SH/` = 'CAM')))
+  str_replace_all(x, c(`OCCAMS/AH/` = 'CAM', `OCCAMS/SH/` = 'CAMa')))
 cosineSims$case <- factor(cosineSims$case, levels= cosineSims$case)
 
 ggplot(cosineSims, aes(x = case, y = cosineSims)) +
@@ -761,10 +777,10 @@ sigs.extracted_complete %>%
   pivot_wider(names_from = specimen_source, values_from = Proportion) -> df.sig17_compare
 
 ggplot(df.sig17_compare, aes(x = tissue, y = organoid)) + theme_bw() +
-  geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point(aes(color = `Concordance < 10%`)) + geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   geom_smooth(data = df.sig17_compare[df.sig17_compare$`Concordance < 10%` == FALSE, ], method = 'lm', color = 'navy') +
   stat_cor(data = df.sig17_compare[df.sig17_compare$`Concordance < 10%` == FALSE, ], color = 'navy',
-           label.x.npc =  'centre', label.y.npc = 'bottom') +
+           label.x.npc =  'centre', label.y.npc = 'bottom', p.accuracy = 0.001) +
   geom_abline(col = 'red', linetype = 'dashed', slope = 1, intercept = 0) +
   scale_color_manual(values = c('gray50','red')) +
   theme(legend.position = 'top') +
@@ -848,50 +864,78 @@ muts.oac_ann <- merge(x = muts.oac_ann, y = df.sig17, all.x = TRUE) # add SBS17
 # Add SBS18 and SBS40 - this will be for the summary plot
 muts.oac_ann <- merge(x = muts.oac_ann, y = sigs.extracted_complete[,c('sequence_id','SBS18','SBS40')], all.x = TRUE)
 
-# Now we can add relevant clinical information
-#   Note that we will have to add the Birmingham organoids, and the AHM OAC organoids, manually
-occams.clin <- read_excel('Data/query_standard_cohort_2025-03-25_16-27-46.xlsx')
-occams.clin <- occams.clin[,c(1:3,12)]
-names(occams.clin) <- c('case_id','Sex','Age','Stage')
-occams.clin <- occams.clin %>% filter(!duplicated(case_id))
+# # Now we can add relevant clinical information
+# #   Note that we will have to add the Birmingham organoids, and the AHM OAC organoids, manually
+# occams.clin <- read_excel('Data/query_standard_cohort_2025-03-25_16-27-46.xlsx')
+# occams.clin <- occams.clin[,c(1:3,12)]
+# names(occams.clin) <- c('case_id','Sex','Age','Stage')
+# occams.clin <- occams.clin %>% filter(!duplicated(case_id))
+# 
+# # Alter invasion labels in stage data
+# occams.clin$Stage[occams.clin$Stage == 'tumour_invades_adventitia'] <- 'T3b'
+# occams.clin$Stage[occams.clin$Stage == 'tumour_invades_muscularis_propria'] <- 'T2'
+# occams.clin$Stage <- factor(occams.clin$Stage, levels = sort(unique(occams.clin$Stage)))
 
-# Alter invasion labels in stage data
-occams.clin$Stage[occams.clin$Stage == 'tumour_invades_adventitia'] <- 'T3b'
-occams.clin$Stage[occams.clin$Stage == 'tumour_invades_muscularis_propria'] <- 'T2'
-occams.clin$Stage <- factor(occams.clin$Stage, levels = sort(unique(occams.clin$Stage)))
-
-# Add chemo and histopath. grading
+# Add chemo, surgical T-stage, and histopath. grading
 occams.grad <- read_excel('Data/Copy of Org_Clinical_demo_For_DJ.xlsx') %>%
   dplyr::filter(!is.na(`Chemotherapy regimen`))
+
+# Repeat OCCAMS/AH/453 for staging lap
+occams.grad <- data.frame(
+  ID=c(occams.grad$ID,'OCCAMS/AH/453L'),
+  Age=c(occams.grad$Age,69), Sex=c(occams.grad$Sex,'M'), `Surgical TNM`=c(occams.grad$`Surgical TNM`,'T3N1M0'),
+  `Chemotherapy regimen`=c(occams.grad$`Chemotherapy regimen`,'ECX'), 
+  `Histopathological grading`=c(occams.grad$`Histopathological grading`,'Poor')
+)
+names(occams.grad) <- c('ID','Age','Sex','Surgical TNM','Chemotherapy regimen','Histopathological grading')
+
 occams.grad$`Histopathological grading`[occams.grad$`Histopathological grading` == 'Moderate '] <- 'Moderate'
+occams.grad$Stage <- sapply(occams.grad$`Surgical TNM`, function(x) strsplit(x,split='N')[[1]][1])
+occams.grad$Stage[occams.grad$Stage == '-'] <- 'Missing'
 
-occams.clin <- merge(x = occams.clin, y = occams.grad[,c('ID','Chemotherapy regimen','Histopathological grading')],
-                     by.x = 'case_id', by.y = 'ID', all.x = TRUE)
+# occams.clin <- merge(x = occams.clin, y = occams.grad[,c('ID','Age','Sex','Stage','Chemotherapy regimen','Histopathological grading')],
+#                      by.x = 'case_id', by.y = 'ID', all.x = TRUE)
+# 
+# # Add info for missing cases (from attached file)
+# print(occams.clin$case_id[is.na(occams.clin$`Chemotherapy regimen`)]) # to show order
+# occams.clin$`Chemotherapy regimen`[is.na(occams.clin$`Chemotherapy regimen`)] <- 
+#   c('ECX','ECX','ECF','None','ECX',NA)
+# occams.clin$`Histopathological grading`[is.na(occams.clin$`Histopathological grading`)] <- 
+#   c('Moderate','Unknown','Moderate','Poor','Poor',NA)
 
-muts.oac_ann <- merge(x = muts.oac_ann, y = occams.clin, all.x = TRUE)
+# Merge with genomic features
+muts.oac_ann <- merge(x = muts.oac_ann, y = occams.grad[,c('ID','Age','Sex','Stage','Chemotherapy regimen','Histopathological grading')], 
+                      all.x = TRUE,
+                      by.x = 'case_id', by.y = 'ID')
 
 # Manually add AHM information on sex, age, and stage [TO BE DONE]
 
-muts.oac_ann$Stage[muts.oac_ann$case_id == 'OCCAMS/AH/629'] <- 'T3'
-
-# Manually add OC/AH/748
-muts.oac_ann$Sex[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'male'
-muts.oac_ann$Age[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 72
-muts.oac_ann$Stage[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'T3'
+# # Manually add OC/AH/748
+# muts.oac_ann$Sex[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'male'
+# muts.oac_ann$Age[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 72
+# muts.oac_ann$Stage[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'T3'
+# muts.oac_ann$`Chemotherapy regimen`[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'None'
+# muts.oac_ann$`Histopathological grading`[muts.oac_ann$case_id == 'OCCAMS/AH/748'] <- 'No pathology'
 
 # Manually add Birmingham organoids
-muts.oac_ann$Sex[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('male','male')
-muts.oac_ann$Age[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c(61,73)
-muts.oac_ann$Stage[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('T3b','T1b')
+# muts.oac_ann$Sex[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('male','male')
+# muts.oac_ann$Age[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c(61,73)
+# muts.oac_ann$Stage[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('T3b','T1b')
+# muts.oac_ann$`Chemotherapy regimen`[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('None','None')
+muts.oac_ann$`Histopathological grading`[match(c('OESO/117','OESO/146'), muts.oac_ann$case_id)] <- c('Unknown','Unknown')
 
 # Manually add AHM organoids
-muts.oac_ann$Sex[muts.oac_ann$case_id == 'AHM/2165'] <- 'male'
+muts.oac_ann$Sex[muts.oac_ann$case_id == 'AHM/2165'] <- 'M'
 muts.oac_ann$Age[muts.oac_ann$case_id == 'AHM/2165'] <- 77
 muts.oac_ann$Stage[muts.oac_ann$case_id == 'AHM/2165'] <- 'T1'
+muts.oac_ann$`Chemotherapy regimen`[muts.oac_ann$case_id == 'AHM/2165'] <- 'None'
+muts.oac_ann$`Histopathological grading`[muts.oac_ann$case_id == 'AHM/2165'] <- 'No pathology'
 
-muts.oac_ann$Sex[muts.oac_ann$case_id == 'AHM/2392'] <- 'female'
+muts.oac_ann$Sex[muts.oac_ann$case_id == 'AHM/2392'] <- 'F'
 muts.oac_ann$Age[muts.oac_ann$case_id == 'AHM/2392'] <- 87
 muts.oac_ann$Stage[muts.oac_ann$case_id == 'AHM/2392'] <- 'T1'
+muts.oac_ann$`Chemotherapy regimen`[muts.oac_ann$case_id == 'AHM/2392'] <- 'None'
+muts.oac_ann$`Histopathological grading`[muts.oac_ann$case_id == 'AHM/2392'] <- 'No pathology'
 
 # Fix up annotation data, and reorder by stage, case ID, and specimen source for plotting
 #   
@@ -901,10 +945,10 @@ muts.oac_ann <- muts.oac_ann %>% arrange(Stage, case_id, desc(specimen_source))
 
 # For the sake of curiosity (given reporting in Secrier et al. 2016), check relationship between TMB and SBS17 contribution
 ggplot(muts.oac_ann, aes(x = SBS17, y = TMB)) + theme_bw() +
-  geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   labs(x = 'Signature 17 Contribution', y = 'Tumour Mutation Burden (muts/Mb)') +
   facet_wrap(~specimen_source)
-# ggsave(filename = 'Results/OrganoidsOAC_TMBvsSig17.pdf', height = 5)
+ggsave(filename = 'Results/OrganoidsOAC_TMBvsSig17.pdf', height = 5)
 
 # Reorder oncoplot data to reflect annotation shown here
 muts.oac_plot <- muts.oac_plot[,muts.oac_ann$sequence_id]
@@ -980,19 +1024,27 @@ heatmap_legend_param = list(title = "Alterations", at = names(col), labels = nam
 
 # Alter column names, for ease of reading. This involves 'OCCAMS/AH', being replace with 'CAM', and clarification of organoid or tumour
 muts.oac_ann$column_name <- muts.oac_ann$case_id
-muts.oac_ann$column_name[grepl(pattern = 'OCCAMS', muts.oac_ann$column_name)] <- sapply(
-  muts.oac_ann$case_id[grepl(pattern = 'OCCAMS', muts.oac_ann$case_id)], function(x)
+muts.oac_ann$column_name[grepl(pattern = 'OCCAMS/AH', muts.oac_ann$column_name)] <- sapply(
+  muts.oac_ann$case_id[grepl(pattern = 'OCCAMS/AH', muts.oac_ann$case_id)], function(x)
     paste0('CAM',strsplit(x,split='/')[[1]][3])
+)
+muts.oac_ann$column_name[grepl(pattern = 'OCCAMS/SH', muts.oac_ann$column_name)] <- sapply(
+  muts.oac_ann$case_id[grepl(pattern = 'OCCAMS/SH', muts.oac_ann$case_id)], function(x)
+    paste0('CAMa',strsplit(x,split='/')[[1]][3])
 )
 muts.oac_ann$column_name <- apply(muts.oac_ann, 1, function(x)
   paste(x['column_name'],toupper(substr(x['specimen_source'],1,1)),sep='_'))
 
 colnames(muts.oac_plot) <- muts.oac_ann$column_name
 
-muts.oac_ann$`Histopathological grading`[60] <- 'Moderate'
+# Change case where histopathological grading is 'Moderate '
+muts.oac_ann$`Histopathological grading`[17] <- 'Moderate'
+
+# Remove genes found in only one tissue/organoid
+muts.oac_plot <- muts.oac_plot[apply(muts.oac_plot, 1, function(x) sum(x != '') > 1), ]
 
 # Final oncoprint formation
-# pdf('Results/Oncoplot_OACtissuesOrganoids.pdf', width = 16, height = 12)
+pdf('Results/Oncoplot_OACtissuesOrganoids.pdf', width = 16, height = 12)
 oncoPrint(muts.oac_plot,
           alter_fun = alter_fun, col = col.bars,
           column_split = data.frame(muts.oac_ann$Stage, muts.oac_ann$case_id),
@@ -1011,13 +1063,13 @@ oncoPrint(muts.oac_plot,
             `Tissue/Organoid` = muts.oac_ann$specimen_source,
             col = list(cbar = col.bars,
                        `Tissue/Organoid` = c('tissue'='gray20','organoid'='gray90'),
-                       `Sex` = c('male' = 'darkblue', 'female' = 'lightblue'),
-                       `Tumour Stage` = c('T1' = 'yellow1','T1b' = 'yellow3',
+                       `Sex` = c('M' = 'darkblue', 'F' = 'lightblue'),
+                       `Tumour Stage` = c('T1' = 'yellow1','T1a' = 'yellow2','T1b' = 'yellow3',
                                           'T2' = 'orange',
-                                          'T3' = 'red', 'T3b' = 'red3',
-                                          'T4' = 'brown', 'Tx' = 'grey'),
-                       `Histopathological Grading` = c('Moderate' = 'plum1', 'Poor' = 'mediumorchid4'),
-                       `Chemotherapy` = c('CF' = 'lightblue1', 'ECF' = 'lightblue3', 'ECX' = 'navy', 'FLOT' = 'pink3', 'None' = 'white'),
+                                          'T3' = 'red', 'T4a' = 'red3',
+                                          'T4b' = 'brown', 'Missing' = 'grey'),
+                       `Histopathological Grading` = c('Well' = 'pink', 'Moderate' = 'plum1', 'Poor' = 'mediumorchid4', 'Unknown' = 'gray85', 'No pathology' = 'gray25'),
+                       `Chemotherapy` = c('CF' = 'lightblue1', 'ECF' = 'lightblue3', 'ECX' = 'navy', 'EOX' = 'aquamarine4', 'CX-Trastuzumab' = 'aquamarine3', 'FLOT' = 'pink3', 'None' = 'white', 'N/A' = 'gray85'),
                        `Signature 17` = colorRamp2(c(0,max(muts.oac_ann$SBS17, na.rm = TRUE)),
                                                           colors = c('white','green4')),
                        `HRD score` = colorRamp2(c(0,max(muts.oac_ann$`HRD-sum`, na.rm = TRUE)),
@@ -1033,11 +1085,18 @@ oncoPrint(muts.oac_plot,
           heatmap_legend_param = heatmap_legend_param,
           column_order = colnames(muts.oac_plot),
           show_column_names = TRUE)
-# dev.off()
+dev.off()
 
 # Save annotation and coding mutation data
 write.csv(muts.oac_ann, file = 'Results/Oncoplot_OAC_annotation.csv')
 write.csv(muts.oac, file = 'Results/OrganoidsOAC_OACcodingAlterations.csv')
+
+# Finally, let's report the frequencies of the key drivers in our OAC PDOs
+muts.oac %>%
+  filter(specimen_source == 'organoid') %>%
+  group_by(occams.ID, Gene) %>% summarise() %>%
+  group_by(Gene) %>% summarise(altered_PDO = n(), prop_altered_PDO = n()/sum(muts.oac_ann$specimen_source == 'organoid')) %>%
+  arrange(desc(prop_altered_PDO))
 
 ```
 
@@ -1109,8 +1168,8 @@ ggplot(vcfs.shared, aes(x = VAF_diff)) + theme_bw() +
   geom_histogram(bins = 50, fill = 'steelblue', color = 'white') +
   geom_vline(col = 'red', linetype = 'dashed', xintercept = 0) +
   xlab('VAF (organoid) - VAF (tissue)')
-# ggsave(filename = 'Results/OrganoidsOAC_differencesVAF.pdf',
-#        width = 5, height = 5)
+ggsave(filename = 'Results/OrganoidsOAC_differencesVAF.pdf',
+       width = 5, height = 5)
 
 # Label mutations as Concordant, Organoid_only, or Tissue_only, add case_id and summarise counts of each
 vcfs.shared$Label <- 'Concordant'
@@ -1121,7 +1180,7 @@ vcfs.shared$case_id <- sapply(vcfs.shared$MUTATION_ID, function(x) strsplit(x,sp
 
 muts.shared_summary <- vcfs.shared %>%
   group_by(case_id, Label) %>% summarise(n=n()) %>%
-  mutate(case_id = sapply(case_id, function(x) str_replace_all(x, c(`OCCAMS/AH/` = 'CAM', `OCCAMS/SH/` = 'CAM'))))
+  mutate(case_id = sapply(case_id, function(x) str_replace_all(x, c(`OCCAMS/AH/` = 'CAM', `OCCAMS/SH/` = 'CAMa'))))
 
 # Rank case_id by percentage of concordant mutations, and remove samples with no matched tissue
 muts.concordant <-muts.shared_summary %>%
@@ -1165,7 +1224,11 @@ muts.concordant_purity <- merge(x = muts.concordant[,c('case_id','percentage_Con
 
 ggplot(muts.concordant_purity, aes(x = 100*Purity, y = 100*percentage_Concordant)) + 
   theme_bw() +
-  geom_point() + geom_smooth(method = 'lm') + stat_cor() +
+  geom_point() + geom_smooth(method = 'lm') + stat_cor(p.accuracy = 0.001) +
   labs(x = 'Purity (%)', y = 'Proportion of Concordant Mutations (%)')
+```
+
+```{r session-info}
+sessionInfo()
 ```
 

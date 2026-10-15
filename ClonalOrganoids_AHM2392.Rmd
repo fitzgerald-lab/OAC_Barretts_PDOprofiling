@@ -285,6 +285,7 @@ vep.oac <- vep.oac %>%
   group_by(sequence_id, mutationID, Gene, mutationType) %>% 
   summarise(Present = 1)
 
+write.csv(vep.oac, file = 'Results/ClonalOrganoids_AHM2392_summaryVEP.csv')
 ```
 
 We can repeat data colleciton for CNAs. Here, we use Ensembl to match OAC-linked driver genes with their positions, which are then matched to the respective ASCAT output. Alterations are then highlighted and extracted.
@@ -301,14 +302,16 @@ df.ploidy <- data.frame()
 
 # In this case, we will start with the gene list and match the copy number profiles
 
-mart <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="https://grch37.ensembl.org", 
-                path="/biomart/martservice", dataset="hsapiens_gene_ensembl")
+
+load('~/Documents/Data/mart.homosapiens.hg19.Rdata')
 gene_positions <- getBM(
   attributes = c('hgnc_symbol','chromosome_name','start_position','end_position'),
   filters = c('hgnc_symbol'),
   values = list(gene_drivers),
   mart=mart
 )
+gene_positions <- gene_positions %>% dplyr::filter(chromosome_name %in% c(1:22,'X','Y'))
+
 
 # Define 'by' statement for joining with caveman output
 by = join_by(
@@ -900,5 +903,9 @@ ggplot(df.marker_plot, aes(x = CDX2, y = MUC6)) + theme_bw() +
   labs(x = 'CDX2 (log2-TPM)', y = 'MUC6 (log2-TPM)')
 ggsave(filename = 'Results/AHM2392_RNAseq_GastricIntestinal.pdf')
 
+```
+
+```{r session-info}
+sessionInfo()
 ```
 
